@@ -1,5 +1,10 @@
 # Colosseum Inspired UI Overhaul — 1.0.0
 
+> [!CAUTION]
+> **Do not use GitHub's green `Code` → `Download ZIP` button.** That archive is repository source, not the installable Gen1Recomp mod, and will report a missing `main.lua` entry.
+>
+> Install only the file named **`Colosseum-Inspired-UI-Overhaul-1.0.0.zip`** from the repository's **Releases** section. Until that Release asset is visible, use the verified build supplied by the project author.
+
 A presentation-focused **Gen1Recomp** mod that gives Gen I and Gen II a unified interface inspired by Pokémon Colosseum while leaving native gameplay logic authoritative.
 
 ## Highlights
@@ -14,10 +19,15 @@ A presentation-focused **Gen1Recomp** mod that gives Gen I and Gen II a unified 
 
 ## Installation
 
-1. Download `Colosseum-Inspired-UI-Overhaul-1.0.0.zip` from the repository release.
-2. Place the ZIP in the Gen1Recomp mods folder.
-3. Enable **Colosseum Inspired UI Overhaul** in the mod manager.
-4. Do not enable the separate Gen 3 Inspired UI Overhaul at the same time; both modify the same UI hooks.
+1. Open the repository's **Releases** section.
+2. Download the Release asset named `Colosseum-Inspired-UI-Overhaul-1.0.0.zip`.
+3. Place that ZIP in the Gen1Recomp mods folder without extracting it.
+4. Enable **Colosseum Inspired UI Overhaul** in the mod manager.
+5. Do not enable the separate Gen 3 Inspired UI Overhaul at the same time; both modify the same UI hooks.
+
+## Update channel
+
+Launcher updates must use the latest published GitHub Release and its attached installable ZIP asset. Release assets provide stable versioned download URLs and GitHub download counters; repository source archives do not.
 
 ## Settings
 
