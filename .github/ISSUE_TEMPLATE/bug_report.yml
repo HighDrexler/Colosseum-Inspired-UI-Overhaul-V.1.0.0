@@ -1,0 +1,48 @@
+name: Bug report
+description: Report a reproducible UI, crash, or compatibility issue
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: dropdown
+    id: generation
+    attributes:
+      label: Game generation
+      options:
+        - Gen 1
+        - Gen 2 / Gold
+        - Both
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Mod version
+      placeholder: "1.0.0"
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the visible issue or crash.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Launch...
+        2. Open...
+        3. Select...
+    validations:
+      required: true
+  - type: textarea
+    id: mods
+    attributes:
+      label: Other enabled mods
+      description: Include sprite, battle, UI, Moves Manager, and compatibility mods.
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Screenshots, video, or logs
