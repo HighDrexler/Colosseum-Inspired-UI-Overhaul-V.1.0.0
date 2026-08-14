@@ -1,0 +1,202 @@
+name: Bootstrap complete mod source
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.bootstrap/READY'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip if bootstrap payload is absent
+        id: payload
+        shell: bash
+        run: |
+          if test -f .bootstrap/READY && compgen -G '.bootstrap/main/part-*' > /dev/null; then
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore finalized main.lua
+        if: steps.payload.outputs.ready == 'true'
+        shell: bash
+        run: |
+          cat .bootstrap/main/part-* | base64 -d | gzip -dc > main.lua
+          echo 'ef82c537e1e44be4548a7abfe9cdfabce3e6b116a6beda569883e20e03cbe1ea  main.lua' | sha256sum -c -
+
+      - name: Download Colosseum portraits from the documented source
+        if: steps.payload.outputs.ready == 'true'
+        shell: bash
+        run: |
+          rm -rf assets/portraits
+          mkdir -p assets/portraits
+          python - <<'PY'
+          import pathlib, re, time
+          import urllib.parse, urllib.request, json
+
+          API = 'https://archives.bulbagarden.net/w/api.php'
+          OUT = pathlib.Path('assets/portraits')
+          OUT.mkdir(parents=True, exist_ok=True)
+          UA = 'Colosseum-Inspired-UI-Overhaul/1.0.0 GitHub source bootstrap'
+
+          def api(params):
+              params = dict(params)
+              params['format'] = 'json'
+              req = urllib.request.Request(API + '?' + urllib.parse.urlencode(params), headers={'User-Agent': UA})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return json.load(r)
+
+          def category(name):
+              out = []
+              cont = None
+              while True:
+                  p = {'action':'query','list':'categorymembers','cmtitle':name,'cmtype':'file','cmlimit':'500'}
+                  if cont:
+                      p['cmcontinue'] = cont
+                  data = api(p)
+                  out.extend(x['title'] for x in data['query']['categorymembers'])
+                  cont = data.get('continue', {}).get('cmcontinue')
+                  if not cont:
+                      return out
+
+          def image_url(title):
+              data = api({'action':'query','titles':title,'prop':'imageinfo','iiprop':'url'})
+              page = next(iter(data['query']['pages'].values()))
+              return page['imageinfo'][0]['url']
+
+          def download(title, dest):
+              url = image_url(title)
+              req = urllib.request.Request(url, headers={'User-Agent': UA})
+              with urllib.request.urlopen(req, timeout=90) as r, open(dest, 'wb') as f:
+                  f.write(r.read())
+              raw = pathlib.Path(dest).read_bytes()
+              if raw[:8] != b'\x89PNG\r\n\x1a\n':
+                  raise RuntimeError(f'Not a PNG: {title}')
+              width = int.from_bytes(raw[16:20], 'big')
+              height = int.from_bytes(raw[20:24], 'big')
+              if (width, height) != (44, 44):
+                  raise RuntimeError(f'Unexpected dimensions for {title}: {width}x{height}')
+
+          def install(cat, shiny):
+              titles = category(cat)
+              groups = {}
+              rx = re.compile(r'^File:Menu Colo (\d{3})(.*?)\.png$', re.I)
+              for title in titles:
+                  m = rx.match(title)
+                  if not m:
+                      continue
+                  dex = int(m.group(1))
+                  if dex > 251:
+                      continue
+                  groups.setdefault(dex, []).append(title)
+
+              for dex in range(1, 252):
+                  choices = groups.get(dex, [])
+                  expected = f'File:Menu Colo {dex:03d}{" s" if shiny else ""}.png'
+                  primary = next((t for t in choices if t.lower() == expected.lower()), None)
+                  if not primary:
+                      raise RuntimeError(f'Missing primary portrait: {expected}')
+                  extras = sorted(t for t in choices if t != primary)
+                  ordered = [primary] + extras
+                  for frame, title in enumerate(ordered, 1):
+                      suffix = '_shiny' if shiny else ''
+                      dest = OUT / f'{dex:03d}_{frame}{suffix}.png'
+                      download(title, dest)
+                      print(dest)
+                      time.sleep(0.03)
+
+          install('Category:Colosseum menu sprites', False)
+          install('Category:Colosseum Shiny menu sprites', True)
+
+          files = list(OUT.glob('*.png'))
+          if len(files) < 502:
+              raise RuntimeError(f'Portrait set incomplete: only {len(files)} PNG files')
+          for required in ('044_1.png','044_2.png','044_1_shiny.png','044_2_shiny.png','251_1.png','251_1_shiny.png'):
+              if not (OUT / required).is_file():
+                  raise RuntimeError(f'Missing required portrait {required}')
+          print(f'Installed {len(files)} Colosseum portrait PNGs')
+          PY
+
+      - name: Restore title/menu audio
+        if: steps.payload.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -e
+          mkdir -p assets/audio /tmp/colo-audio
+          rm -f assets/audio/colosseum_title.ogg
+
+          # Prefer the same commonly-circulated 1:41 title-track source used by
+          # the finalized build, then apply the approved physical 1.000 s trim.
+          python -m pip install --disable-pip-version-check --quiet yt-dlp
+          if yt-dlp --no-playlist --max-downloads 1 \
+              --match-filter 'duration >= 99 & duration <= 103' \
+              -x --audio-format wav \
+              -o '/tmp/colo-audio/source.%(ext)s' \
+              'ytsearch5:Pokemon- Colosseum- Title- Music'; then
+            SOURCE=$(find /tmp/colo-audio -type f -name 'source.*' | head -1)
+          else
+            SOURCE=''
+          fi
+
+          if test -z "$SOURCE" || test ! -s "$SOURCE"; then
+            echo 'YouTube source unavailable; attempting BRSTM soundtrack mirror.'
+            curl -fL --retry 3 -A 'Mozilla/5.0' 'https://smashcustommusic.net/brstm/6951' -o /tmp/colo-audio/source.brstm
+            SOURCE=/tmp/colo-audio/source.brstm
+          fi
+
+          ffmpeg -hide_banner -loglevel error -y -ss 1.000 -i "$SOURCE" -c:a libvorbis -q:a 5 assets/audio/colosseum_title.ogg
+          DURATION=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 assets/audio/colosseum_title.ogg)
+          python - "$DURATION" <<'PY'
+          import sys
+          d=float(sys.argv[1])
+          if not 98.5 <= d <= 100.5:
+              raise SystemExit(f'Unexpected title audio duration: {d:.3f}s')
+          print(f'Title audio duration: {d:.3f}s')
+          PY
+
+      - name: Validate complete Gen1Recomp mod tree
+        if: steps.payload.outputs.ready == 'true'
+        shell: bash
+        run: |
+          test -s main.lua
+          test -s manifest.json
+          test -s assets/audio/colosseum_title.ogg
+          test -s assets/portrait_map.json
+          test -s assets/portrait_corrections/139.b64
+          test -s assets/portrait_corrections/139_shiny.b64
+          test -s assets/portrait_corrections/141.b64
+          test -s assets/portrait_corrections/141_shiny.b64
+          test "$(find assets/portraits -type f -name '*.png' | wc -l)" -ge 502
+          jq -e '.entry == "main.lua" and .version == "1.0.0"' manifest.json
+
+      - name: Build installable v1.0.0 ZIP
+        if: steps.payload.outputs.ready == 'true'
+        shell: bash
+        run: |
+          mkdir -p releases
+          rm -f releases/Colosseum-Inspired-UI-Overhaul-1.0.0.zip releases/Colosseum-Inspired-UI-Overhaul-1.0.0.zip.sha256
+          zip -9 -q -r releases/Colosseum-Inspired-UI-Overhaul-1.0.0.zip \
+            manifest.json main.lua assets README.md CHANGELOG.md ARCHITECTURE.md GOLD_COMPATIBILITY.md NATIVE_SCREEN_SPEC.md
+          unzip -t releases/Colosseum-Inspired-UI-Overhaul-1.0.0.zip
+          unzip -l releases/Colosseum-Inspired-UI-Overhaul-1.0.0.zip | grep -q ' main.lua$'
+          sha256sum releases/Colosseum-Inspired-UI-Overhaul-1.0.0.zip > releases/Colosseum-Inspired-UI-Overhaul-1.0.0.zip.sha256
+
+      - name: Commit functional repository source
+        if: steps.payload.outputs.ready == 'true'
+        shell: bash
+        run: |
+          rm -rf .bootstrap
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Publish complete Colosseum UI Overhaul 1.0.0 source'
+          git push
