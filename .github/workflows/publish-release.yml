@@ -1,13 +1,15 @@
 name: Publish release asset
 
 on:
-  workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - 'releases/**'
       - 'manifest.json'
+      - 'main.lua'
+      - 'assets/**'
+      - 'CHANGELOG.md'
       - '.github/workflows/publish-release.yml'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -18,33 +20,54 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Read version
-        id: version
+      - name: Read release metadata
+        id: meta
         shell: bash
         run: |
-          VERSION=$(jq -r '.version' manifest.json)
+          VERSION="$(jq -r '.version' manifest.json)"
+          test "$VERSION" = '1.0.0'
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
-          echo "asset=releases/Colosseum-Inspired-UI-Overhaul-$VERSION.zip" >> "$GITHUB_OUTPUT"
+          echo "asset=Colosseum-Inspired-UI-Overhaul-$VERSION.zip" >> "$GITHUB_OUTPUT"
 
-      - name: Validate installable ZIP
+      - name: Validate repository as a Gen1Recomp mod
         shell: bash
         run: |
-          test -f "${{ steps.version.outputs.asset }}"
-          unzip -t "${{ steps.version.outputs.asset }}"
-          unzip -p "${{ steps.version.outputs.asset }}" manifest.json | jq -e '.entry == "main.lua" and .version == "${{ steps.version.outputs.version }}"'
-          unzip -l "${{ steps.version.outputs.asset }}" | grep -q ' main.lua$'
+          test -s manifest.json
+          test -s main.lua
+          test -s assets/audio/colosseum_title.ogg
+          test -s assets/portrait_map.json
+          test "$(find assets/portraits -type f -name '*.png' | wc -l)" -eq 530
+          jq -e '.entry == "main.lua" and .version == "1.0.0"' manifest.json
+          echo 'ef82c537e1e44be4548a7abfe9cdfabce3e6b116a6beda569883e20e03cbe1ea  main.lua' | sha256sum -c -
+
+      - name: Build installable release ZIP from repository source
+        shell: bash
+        run: |
+          ASSET='${{ steps.meta.outputs.asset }}'
+          zip -9 -q -r "$ASSET" \
+            manifest.json main.lua assets README.md CHANGELOG.md ARCHITECTURE.md GOLD_COMPATIBILITY.md NATIVE_SCREEN_SPEC.md
+          unzip -t "$ASSET"
+          unzip -l "$ASSET" | grep -q ' main.lua$'
+          unzip -l "$ASSET" | grep -q ' manifest.json$'
+          unzip -l "$ASSET" | grep -q ' assets/audio/colosseum_title.ogg$'
+          sha256sum "$ASSET" > "$ASSET.sha256"
 
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.tag }}
-          VERSION: ${{ steps.version.outputs.version }}
-          ASSET: ${{ steps.version.outputs.asset }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          ASSET: ${{ steps.meta.outputs.asset }}
         shell: bash
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$ASSET" --clobber
+            gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber
+            gh release edit "$TAG" --title "Colosseum Inspired UI Overhaul v$VERSION" --notes-file CHANGELOG.md --latest
           else
-            gh release create "$TAG" "$ASSET" --target "$GITHUB_SHA" --title "Colosseum Inspired UI Overhaul v$VERSION" --notes-file CHANGELOG.md --latest
+            gh release create "$TAG" "$ASSET" "$ASSET.sha256" \
+              --target "$GITHUB_SHA" \
+              --title "Colosseum Inspired UI Overhaul v$VERSION" \
+              --notes-file CHANGELOG.md \
+              --latest
           fi
