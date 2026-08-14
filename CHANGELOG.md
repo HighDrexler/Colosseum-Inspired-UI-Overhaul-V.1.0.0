@@ -18,4 +18,4 @@ First public release of the standalone Colosseum Inspired UI Overhaul.
 - Normalized package and manifest versioning to `1.0.0`.
 - Removed pre-release and obsolete title-timing labels from the runtime and public documentation.
 - Consolidated pre-release notes into this release changelog.
-- Verified Lua syntax, JSON validity, archive contents, title-audio duration, and SHA-256 integrity before packaging.
+- Verified runtime reference integrity, JSON validity, archive contents, portrait assets, title-audio decoding/duration, and SHA-256 integrity before packaging.
