@@ -60,18 +60,11 @@ jobs:
           cat /tmp/v1.1-notes.md CHANGELOG.md > /tmp/changelog.md
           mv /tmp/changelog.md CHANGELOG.md
 
-          sed -i "s/test \"\$VERSION\" = '1\.0\.0'/test \"\$VERSION\" = '1.1.0'/" .github/workflows/publish-release.yml
-          sed -i 's/\.version == "1\.0\.0"/.version == "1.1.0"/' .github/workflows/publish-release.yml
-          sed -i 's/ef82c537e1e44be4548a7abfe9cdfabce3e6b116a6beda569883e20e03cbe1ea/ddb67cafbe03be542cdd3228a1cac05d0eadc73978b0993cee2bf49614f59e4f/' .github/workflows/publish-release.yml
-
-          rm -rf .release-staging
-          rm -f .github/workflows/apply-v1.1-release.yml
-
       - name: Commit v1.1 source to main
         shell: bash
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A
+          git add main.lua manifest.json README.md CHANGELOG.md
           git commit -m 'Release Colosseum UI Overhaul v1.1.0'
           git push origin HEAD:main
