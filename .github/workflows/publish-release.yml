@@ -25,7 +25,7 @@ jobs:
         shell: bash
         run: |
           VERSION="$(jq -r '.version' manifest.json)"
-          test "$VERSION" = '1.0.0'
+          test "$VERSION" = '1.1.0'
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
           echo "asset=Colosseum-Inspired-UI-Overhaul-$VERSION.zip" >> "$GITHUB_OUTPUT"
@@ -38,8 +38,8 @@ jobs:
           test -s assets/audio/colosseum_title.ogg
           test -s assets/portrait_map.json
           test "$(find assets/portraits -type f -name '*.png' | wc -l)" -eq 530
-          jq -e '.entry == "main.lua" and .version == "1.0.0"' manifest.json
-          echo 'ef82c537e1e44be4548a7abfe9cdfabce3e6b116a6beda569883e20e03cbe1ea  main.lua' | sha256sum -c -
+          jq -e '.entry == "main.lua" and .version == "1.1.0"' manifest.json
+          echo 'ddb67cafbe03be542cdd3228a1cac05d0eadc73978b0993cee2bf49614f59e4f  main.lua' | sha256sum -c -
 
       - name: Build installable release ZIP from repository source
         shell: bash
@@ -51,6 +51,7 @@ jobs:
           unzip -l "$ASSET" | grep -q ' main.lua$'
           unzip -l "$ASSET" | grep -q ' manifest.json$'
           unzip -l "$ASSET" | grep -q ' assets/audio/colosseum_title.ogg$'
+          test "$(unzip -l "$ASSET" | awk '/assets\/portraits\/.*\.png$/ {n++} END {print n+0}')" -eq 530
           sha256sum "$ASSET" > "$ASSET.sha256"
 
       - name: Publish GitHub Release
