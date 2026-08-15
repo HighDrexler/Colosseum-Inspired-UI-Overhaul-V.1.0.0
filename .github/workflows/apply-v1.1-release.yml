@@ -1,0 +1,75 @@
+name: Apply v1.1 release source
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/apply-v1.1-release.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply exact validated v1.1 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'ef82c537e1e44be4548a7abfe9cdfabce3e6b116a6beda569883e20e03cbe1ea  main.lua' | sha256sum -c -
+          cat .release-staging/v1.1.patch.gz.b64.* | base64 -d | gzip -d > /tmp/v1.1.patch
+          patch -p0 < /tmp/v1.1.patch
+          echo 'ddb67cafbe03be542cdd3228a1cac05d0eadc73978b0993cee2bf49614f59e4f  main.lua' | sha256sum -c -
+
+          jq '.version="1.1.0" | .optional_dependencies += ["STADIUM_BATTLE_FX","BATTLE_CINEMATICS","potato_voxel"] | .github="HighDrexler/Colosseum-Inspired-UI-Overhaul-V.1.0.0"' manifest.json > /tmp/manifest.json
+          mv /tmp/manifest.json manifest.json
+          echo '3bda0e89bc1fef940eb7b9f167da39a21bba424e1a710384530c0beb478fced7  manifest.json' | sha256sum -c -
+
+          sed -i '1s/— 1\.0\.0/— 1.1.0/' README.md
+          sed -i '0,/Version 1\.0\.0 includes/s//Version 1.1.0 includes/' README.md
+
+          cat > /tmp/v1.1-notes.md <<'EOF'
+          # 1.1.0
+
+          Compatibility and full-flow UI release.
+
+          - Reworked UI ownership around the current Gen1Recomp API so Colosseum presentation remains authoritative while camera, voxel, model, animation, and effects mods retain control of their own rendering layers.
+          - Added compatibility-focused ordering and suppression behavior for StadiumBattleFX, Battle Cinematics, Dramatic Shape, Dramaless Shape, Battle Art voxel renderers, potato_voxel, and other renderer stacks without making them hard dependencies.
+          - Strengthened native battle HUD/text suppression so legacy HP/status chrome and bottom battle UI do not reappear when other mods replace battle draw methods.
+          - Added the independent **BATTLE PORTRAITS** option, allowing battle portrait pods to be hidden without affecting HP/status boxes or Colosseum portraits elsewhere.
+          - Restored Colosseum portrait loading under the API-v2 asset sandbox and retained all 530 packaged normal/shiny portrait assets.
+          - Expanded strict presentation ownership for previously uncovered child flows and uncommon native menus while preserving native callbacks, input, saves, inventory, battle logic, and script progression.
+          - Completed Gen I PP/item-target presentation work so move-targeting item flows remain inside the custom Party/Move presentation.
+          - Completed Gen II PokéMart parity: compact hanging BUY, custom Bag-backed SELL, hanging quantity/confirmation surfaces, and dedicated cleaned item-description cards.
+          - Normalized Gen II cartridge item-description control text so `<NEXT>`, narrow-screen word breaks, and `(HOLD)` metadata no longer leak into the modern UI.
+          - Fixed Gen II dialogue ownership regression introduced during compatibility-firewall work, preserving the existing themed TextBox/ChoiceBox flow.
+          - Fixed Gen II PC/menu opacity timing and the new-game NamePick cursor mapping while keeping native state/input ownership intact.
+          - Retained the Gen I 4x dialogue-strobe/photosensitivity fix from 1.0.8.
+          - Removed obsolete broad battle draw monkey-patches in favor of narrower API-v2 visibility/ownership hooks and renderer-specific compatibility adapters.
+          - Performed a final non-functional source cleanup and release metadata normalization without changing approved gameplay/UI behavior.
+
+          EOF
+          sed -i 's/^          //' /tmp/v1.1-notes.md
+          cat /tmp/v1.1-notes.md CHANGELOG.md > /tmp/changelog.md
+          mv /tmp/changelog.md CHANGELOG.md
+
+          sed -i "s/test \"\$VERSION\" = '1\.0\.0'/test \"\$VERSION\" = '1.1.0'/" .github/workflows/publish-release.yml
+          sed -i 's/\.version == "1\.0\.0"/.version == "1.1.0"/' .github/workflows/publish-release.yml
+          sed -i 's/ef82c537e1e44be4548a7abfe9cdfabce3e6b116a6beda569883e20e03cbe1ea/ddb67cafbe03be542cdd3228a1cac05d0eadc73978b0993cee2bf49614f59e4f/' .github/workflows/publish-release.yml
+
+          rm -rf .release-staging
+          rm -f .github/workflows/apply-v1.1-release.yml
+
+      - name: Commit v1.1 source to main
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Release Colosseum UI Overhaul v1.1.0'
+          git push origin HEAD:main
