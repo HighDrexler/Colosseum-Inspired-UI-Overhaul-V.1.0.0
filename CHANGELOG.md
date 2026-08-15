@@ -1,3 +1,22 @@
+# 1.1.0
+
+Compatibility and full-flow UI release.
+
+- Reworked UI ownership around the current Gen1Recomp API so Colosseum presentation remains authoritative while camera, voxel, model, animation, and effects mods retain control of their own rendering layers.
+- Added compatibility-focused ordering and suppression behavior for StadiumBattleFX, Battle Cinematics, Dramatic Shape, Dramaless Shape, Battle Art voxel renderers, potato_voxel, and other renderer stacks without making them hard dependencies.
+- Strengthened native battle HUD/text suppression so legacy HP/status chrome and bottom battle UI do not reappear when other mods replace battle draw methods.
+- Added the independent **BATTLE PORTRAITS** option, allowing battle portrait pods to be hidden without affecting HP/status boxes or Colosseum portraits elsewhere.
+- Restored Colosseum portrait loading under the API-v2 asset sandbox and retained all 530 packaged normal/shiny portrait assets.
+- Expanded strict presentation ownership for previously uncovered child flows and uncommon native menus while preserving native callbacks, input, saves, inventory, battle logic, and script progression.
+- Completed Gen I PP/item-target presentation work so move-targeting item flows remain inside the custom Party/Move presentation.
+- Completed Gen II PokéMart parity: compact hanging BUY, custom Bag-backed SELL, hanging quantity/confirmation surfaces, and dedicated cleaned item-description cards.
+- Normalized Gen II cartridge item-description control text so `<NEXT>`, narrow-screen word breaks, and `(HOLD)` metadata no longer leak into the modern UI.
+- Fixed Gen II dialogue ownership regression introduced during compatibility-firewall work, preserving the existing themed TextBox/ChoiceBox flow.
+- Fixed Gen II PC/menu opacity timing and the new-game NamePick cursor mapping while keeping native state/input ownership intact.
+- Retained the Gen I 4x dialogue-strobe/photosensitivity fix from 1.0.8.
+- Removed obsolete broad battle draw monkey-patches in favor of narrower API-v2 visibility/ownership hooks and renderer-specific compatibility adapters.
+- Performed a final non-functional source cleanup and release metadata normalization without changing approved gameplay/UI behavior.
+
 # 1.0.0
 
 First public release of the standalone Colosseum Inspired UI Overhaul.

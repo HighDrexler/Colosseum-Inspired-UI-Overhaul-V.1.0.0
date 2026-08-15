@@ -1,6 +1,6 @@
-# Colosseum Inspired UI Overhaul — 1.0.0
+# Colosseum Inspired UI Overhaul — 1.1.0
 
-Colosseum Inspired UI Overhaul is a presentation-focused Gen1Recomp mod with unified Gen I and Gen II interfaces inspired by Pokémon Colosseum. Version 1.0.0 includes the finalized cross-generation title presentation, continuous menu-session audio, native gameplay handoffs, and the complete approved UI feature set. The native Red/Blue/Yellow and Gold title screens remain authoritative and untouched.
+Colosseum Inspired UI Overhaul is a presentation-focused Gen1Recomp mod with unified Gen I and Gen II interfaces inspired by Pokémon Colosseum. Version 1.1.0 includes the finalized cross-generation title presentation, continuous menu-session audio, native gameplay handoffs, and the complete approved UI feature set. The native Red/Blue/Yellow and Gold title screens remain authoritative and untouched.
 It does not depend on the Gen 3 Inspired UI Overhaul and intentionally conflicts
 with that donor mod because both patch the same Gen1Recomp UI hooks.
 

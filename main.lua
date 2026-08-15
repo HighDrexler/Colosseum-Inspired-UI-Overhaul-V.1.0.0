@@ -18,6 +18,7 @@ local NamingScreen = require("src.ui.NamingScreen")
 local BoxMenu = require("src.ui.BoxMenu")
 local Boxes = require("src.pokemon.Boxes")
 local QuantityBox = require("src.ui.QuantityBox")
+local ShopMenu = require("src.ui.ShopMenu")
 local Evolution = require("src.pokemon.Evolution")
 local BagInventory = require("src.inventory.Bag")
 local ItemEffects = require("src.inventory.ItemEffects")
@@ -328,10 +329,10 @@ local COLOSSEUM_ICON_FRAMES = {
 -- corrupted in the original imported sheet. They are stored as base64 text so
 -- mod.read() can load them portably from either a directory or a .zip package.
 local COLOSSEUM_ICON_CORRECTIONS = {
-  [139]={normal="assets/portrait_corrections/139.b64",
-    shiny="assets/portrait_corrections/139_shiny.b64"},
-  [141]={normal="assets/portrait_corrections/141.b64",
-    shiny="assets/portrait_corrections/141_shiny.b64"},
+  [139]={normal="assets/portrait_corrections/139.png",
+    shiny="assets/portrait_corrections/139_shiny.png"},
+  [141]={normal="assets/portrait_corrections/141.png",
+    shiny="assets/portrait_corrections/141_shiny.png"},
 }
 
 local function colosseumIconFrame(game,mon)
@@ -372,25 +373,15 @@ local function colosseumIconFrame(game,mon)
   local relative=correction or ("assets/portraits/%03d_%d%s.png"):format(
     dex,frame,shiny and "_shiny" or ""
   )
-  local okRead,bytes=pcall(modRef.read,modRef,relative)
-  if not (okRead and type(bytes)=="string" and #bytes>0) then
+  -- Launcher mod API v2 sandboxes love.filesystem. Load packaged artwork
+  -- through the owning mod's asset facade so directory installs and ZIP mounts
+  -- resolve identically and remain inside the loader's asset cache.
+  if not (modRef.assets and type(modRef.assets.image)=="function") then
     colosseumIconCache[key]=false
     return nil
   end
 
-  if correction then
-    local okDecode,decoded=pcall(love.data.decode,"string","base64",bytes)
-    if not (okDecode and type(decoded)=="string" and #decoded>0) then
-      colosseumIconCache[key]=false
-      return nil
-    end
-    bytes=decoded
-  end
-
-  local okImg,img=pcall(function()
-    local fd=love.filesystem.newFileData(bytes,relative)
-    return love.graphics.newImage(fd)
-  end)
+  local okImg,img=pcall(modRef.assets.image,modRef.assets,relative)
   if not (okImg and img) then
     colosseumIconCache[key]=false
     return nil
@@ -644,7 +635,7 @@ local function enginePortrait(game,mon)
   return image
 end
 
-local function connectDramatic()
+function dramatic.connect()
   if dramatic.V then return true end
   if not (modRef and modRef.find) then return false end
 
@@ -1158,22 +1149,34 @@ local function drawStatusCard(game,battle,b,side)
   local podY=y
 
   statusPlateShape(cardX,y,cardW,cardH,side,u)
-  portraitPod(podX,podY,portrait,u)
 
-  -- Pull the artwork back just enough to expose a firm 3u plated edge.
-  local portraitPad=3*u
-  local px=podX+portraitPad
-  local py=podY+portraitPad
-  local pw=portrait-portraitPad*2
-  local ph=portrait-portraitPad*2
+  -- Battle portraits are independently cosmetic. Disabling this option removes
+  -- the entire pod/badge without changing the HP/status plate geometry or the
+  -- portrait/icon behavior used anywhere outside the battle HUD.
+  local showBattlePortraits=true
+  pcall(function()
+    if modRef and modRef.options and modRef.options.get then
+      showBattlePortraits=(modRef.options:get("battlePortraits") ~= false)
+    end
+  end)
+  if showBattlePortraits then
+    portraitPod(podX,podY,portrait,u)
 
-  local stadiumDrawn,stadiumOwns=drawStadiumPortrait(game,b.mon,px,py,pw,ph)
-  if not stadiumDrawn and not stadiumOwns then
-    drawSpritePortrait(game,b.mon,px,py,pw,ph)
+    -- Pull the artwork back just enough to expose a firm 3u plated edge.
+    local portraitPad=3*u
+    local px=podX+portraitPad
+    local py=podY+portraitPad
+    local pw=portrait-portraitPad*2
+    local ph=portrait-portraitPad*2
+
+    local stadiumDrawn,stadiumOwns=drawStadiumPortrait(game,b.mon,px,py,pw,ph)
+    if not stadiumDrawn and not stadiumOwns then
+      drawSpritePortrait(game,b.mon,px,py,pw,ph)
+    end
+
+    -- Critical ordering: artwork first, visible bevel/keyline last.
+    portraitPodOverlay(podX,podY,portrait,u)
   end
-
-  -- Critical ordering: artwork first, visible bevel/keyline last.
-  portraitPodOverlay(podX,podY,portrait,u)
 
   local textLeft=cardX+18*u
   local textRight=cardX+cardW-18*u
@@ -1582,6 +1585,13 @@ local function drawConsoleMessageLines(lines,waiting,frame)
     love.graphics.polygon("fill",
       cx,cy,cx+12*u,cy,cx+6*u,cy+8*u)
   end
+  -- render.hud runs after Gen I has finished compositing the frame. Unlike the
+  -- battle renderer, the overworld dialogue caller does not surround this
+  -- shared helper with push("all")/pop(). Leaving the continuation cursor's
+  -- red color active therefore tinted the NEXT frame's world canvas red. The
+  -- TextBox blink counter advances on the logic clock, so 4x speed turned that
+  -- leaked state into the rapid full-screen red strobe seen in captures.
+  love.graphics.setColor(1,1,1,1)
   return true
 end
 
@@ -1688,7 +1698,7 @@ local ColosseumUI = {}
 
 function ColosseumUI.install(mod)
   modRef=mod
-  connectDramatic()
+  dramatic.connect()
   if mod and mod.log then
     mod.log:info("Colosseum battle UI renderer loaded")
   end
@@ -1986,15 +1996,15 @@ local spritePortraitResolver = (function()
 
   local function battleArtsImageData(V, relative)
     local owner = V and V.mod
-    if not (owner and type(owner.read) == "function") then return nil end
+    if not (owner and owner.assets and type(owner.assets.path) == "function") then
+      return nil
+    end
 
-    local okRead, bytes = pcall(owner.read, owner, relative)
-    if not (okRead and type(bytes) == "string" and #bytes > 0) then return nil end
-
-    local okData, data = pcall(function()
-      local fd = love.filesystem.newFileData(bytes, relative)
-      return love.image.newImageData(fd)
-    end)
+    -- Cross-mod sprite reads also have to honor the v2 sandbox. Ask Battle
+    -- Arts for its own safe asset path, then let love.image decode that file.
+    local okPath, full = pcall(owner.assets.path, owner.assets, relative)
+    if not (okPath and type(full) == "string") then return nil end
+    local okData, data = pcall(love.image.newImageData, full)
     return okData and data or nil
   end
 
@@ -2425,6 +2435,7 @@ local SCREEN_TOGGLE_SPECS = {
 
 local OPTION_DEFAULTS = {
   colosseumBattleUI = true,
+  battlePortraits = true,
   colosseumPokemonMenu = true,
   colosseumIcons = true,
   colosseumTitleIntro = true,
@@ -2589,6 +2600,14 @@ function GoldCompat.bagPresentationEnabled()
     and featureEnabled("revampedBagUI")
 end
 
+function GoldCompat.strictNativeUiEnabled()
+  -- STRICT NATIVE UI BLOCK is the master guarantee that no unclaimed
+  -- cartridge-era menu chrome is allowed to surface. Individual purpose-built
+  -- toggles still select their richer renderers; this only supplies a
+  -- Colosseum fallback for otherwise-unclaimed gameplay UI.
+  return featureEnabled("hideNativeBattleUI")
+end
+
 function GoldCompat.itemPcPresentationEnabled()
   return featureEnabled("revampedPokemonPC")
     and featureEnabled("revampedItemPCUI")
@@ -2653,6 +2672,133 @@ function GoldCompat.battlePresentationEnabledFor(battle)
       and GoldCompat.safariPresentationEnabled()
   end
   return GoldCompat.battlePresentationEnabled()
+end
+
+function GoldCompat.ownsNativeBattleLayer(state)
+  if not state then return false end
+  local battle=state
+  if not (battle.player or battle.enemy or battle.phase) then
+    local game=state.game or (modRef and modRef.game) or GoldCompat.game
+    battle=game and battleStateInStack(game) or nil
+  end
+  return battle and (GoldCompat.battlePresentationEnabledFor(battle)
+    or featureEnabled("hideNativeBattleUI")) or false
+end
+
+function GoldCompat.patchShapeHudCompat(modId,patchFlag,logLabel)
+  if GoldCompat.generation~="gen1" or not (modRef and modRef.find) then return end
+  local handle=modRef.find(modId)
+  local V=handle and handle.exports and handle.exports.lib
+  if not (V and type(V.require)=="function") then return end
+
+  local ok,OverworldBattle=pcall(V.require,"OverworldBattle")
+  if not (ok and OverworldBattle) then return end
+
+  -- Shape-family renderers may reinstall their battle hooks at battle start.
+  -- Keep our UI ownership as a tiny outer adapter around whichever implementation
+  -- is currently active instead of assuming a one-time patch will stay last.
+  local slot="__colosseumUiCompat_"..tostring(patchFlag)
+  local compat=OverworldBattle[slot]
+  if type(compat)~="table" then
+    compat={}
+    OverworldBattle[slot]=compat
+  end
+
+  local snap=OverworldBattle.snapHUDs
+  if type(snap)=="function" and snap~=compat.snapWrapper then
+    local inner=snap
+    local wrapper=function(battle,shot,...)
+      if GoldCompat.ownsNativeBattleLayer(battle) then return false end
+      return inner(battle,shot,...)
+    end
+    compat.snapWrapper=wrapper
+    OverworldBattle.snapHUDs=wrapper
+  end
+
+  local panels=OverworldBattle.drawHudPanels
+  if type(panels)=="function" and panels~=compat.panelWrapper then
+    local inner=panels
+    local wrapper=function(battle,...)
+      if GoldCompat.ownsNativeBattleLayer(battle) then return end
+      return inner(battle,...)
+    end
+    compat.panelWrapper=wrapper
+    OverworldBattle.drawHudPanels=wrapper
+  end
+
+  if not compat.logged and modRef.log then
+    compat.logged=true
+    modRef.log:info("Colosseum UI: "..logLabel.." battle-HUD compatibility active")
+  end
+end
+
+function GoldCompat.installBattlePredicateGuard(class,name,slot)
+  if not (type(class)=="table" and type(class[name])=="function") then return false end
+  local current=class[name]
+  if current==State[slot] then return false end
+  local inner=current
+  local wrapper=function(self,...)
+    if GoldCompat.ownsNativeBattleLayer(self) then return false end
+    return inner(self,...)
+  end
+  State[slot]=wrapper
+  class[name]=wrapper
+  return true
+end
+
+function GoldCompat.installGen1HudDrawGuard()
+  if type(BattleState.drawHUDs)~="function" then return false end
+  local current=BattleState.drawHUDs
+  if current==State.__colosseumGen1HudDrawGuard then return false end
+  local inner=current
+  local wrapper=function(self,...)
+    if GoldCompat.ownsNativeBattleLayer(self) then
+      -- drawHUDs also owns transient party-ball rows that sit outside the
+      -- launcher's status_hud_visible predicate. Keep any lifecycle work the
+      -- renderer attached to the method, but make every legacy HUD pixel inert.
+      local g=love.graphics
+      g.push("all")
+      g.setScissor(0,0,0,0)
+      local ok,result=pcall(inner,self,...)
+      g.pop()
+      if not ok then error(result) end
+      return result
+    end
+    return inner(self,...)
+  end
+  State.__colosseumGen1HudDrawGuard=wrapper
+  BattleState.drawHUDs=wrapper
+  return true
+end
+
+function GoldCompat.installBattleUiFirewall()
+  -- The launcher hooks remain the primary contract. These method-level guards
+  -- are intentionally narrow fallbacks for renderer mods that cache or replace
+  -- battle draw functions after mod load. They only answer the two visibility
+  -- predicates (plus Gen I's HUD-only draw method for party-ball chrome).
+  if GoldCompat.generation=="gen1" then
+    GoldCompat.installBattlePredicateGuard(BattleState,"bottomUIVisible",
+      "__colosseumGen1BottomPredicate")
+    GoldCompat.installBattlePredicateGuard(BattleState,"statusHUDVisible",
+      "__colosseumGen1StatusPredicate")
+    GoldCompat.installGen1HudDrawGuard()
+
+    -- Reassert renderer-owned HUD capture seams too. This is safe to call many
+    -- times; patchShapeHudCompat only adds a new outer wrapper if another mod
+    -- has actually displaced the previous one.
+    GoldCompat.patchShapeHudCompat(
+      "DRAMALESS_SHAPE","dramaless","Dramaless Shape")
+    GoldCompat.patchShapeHudCompat(
+      "DRAMATIC_SHAPE","dramatic","Dramatic Shape 1.8")
+  else
+    local okGold,GoldBattleState=pcall(require,"src.ui.gen2.BattleState")
+    if okGold and type(GoldBattleState)=="table" then
+      GoldCompat.installBattlePredicateGuard(GoldBattleState,"bottomUIVisible",
+        "__colosseumGen2BottomPredicate")
+      GoldCompat.installBattlePredicateGuard(GoldBattleState,"statusHUDVisible",
+        "__colosseumGen2StatusPredicate")
+    end
+  end
 end
 
 function GoldCompat.colosseumPartyGridIndex(index,count,direction)
@@ -2722,6 +2868,7 @@ end
 
 DexUI.uiRows={
   {key="colosseumBattleUI",label="BATTLE UI",kind="toggle"},
+  {key="battlePortraits",label="BATTLE PORTRAITS",kind="toggle"},
   {key="colosseumPokemonMenu",label="POKéMON MENU",kind="toggle"},
   {key="colosseumIcons",label="COLOSSEUM ICONS",kind="toggle"},
   {key="colosseumTitleIntro",label="MENU INTRO",kind="toggle"},
@@ -3132,6 +3279,12 @@ local function installVerifiedOptions(mod)
       default = true,
     },
     {
+      key = "battlePortraits",
+      type = "toggle",
+      label = "BATTLE PORTRAITS",
+      default = true,
+    },
+    {
       key = "colosseumPokemonMenu",
       type = "toggle",
       label = "POKéMON MENU",
@@ -3508,124 +3661,12 @@ local function runDrawInvisible(fn, self, ...)
 end
 
 local function patchVanillaTextDrawing()
-  -- Gold has a separate BattleState implementation. Its presentation is
-  -- handled by the shared battle.overlay/render.hud compatibility path below;
-  -- do not attach Gen 1 drawTextArea/drawHUDs assumptions to the facade.
-  if GoldCompat.generation=="gen2" then return end
-
-  -- These wrappers preserve lifecycle behavior and reduce redundant native
-  -- drawing on classic builds. The authoritative anti-duplicate guard is the
-  -- final battle.overlay scrub, which also covers WideBattle/local renderers.
+  -- Do not take ownership of BattleState.draw itself. StadiumBattleFX,
+  -- Dramatic Shape and camera/presentation mods legitimately wrap that method.
+  -- The UI overhaul only owns the native UI predicates/HUD-only seam.
   if vanillaTextPatched then return end
-  vanillaTextPatched = true
-
-  -- Chain whatever implementation exists when this mod loads.
-  local originalTextArea = BattleState.drawTextArea
-  if originalTextArea then
-    BattleState.drawTextArea = function(self, ...)
-      -- Hard override: when requested, every native battle text-area draw still
-      -- runs for lifecycle/state purposes but no legacy pixels can reach frame.
-      if featureEnabled("hideNativeBattleUI") then
-        return runDrawInvisible(originalTextArea,self,...)
-      end
-
-      if not GoldCompat.battlePresentationEnabledFor(self) then
-        return originalTextArea(self, ...)
-      end
-
-      if self.phase=="messages"
-          or (self.phase=="menu" and not self.demo)
-          or self.phase=="moveSelect" then
-        return runDrawInvisible(originalTextArea,self,...)
-      end
-
-      return originalTextArea(self,...)
-    end
-  end
-
-  local originalHUDs = BattleState.drawHUDs
-  if originalHUDs then
-    BattleState.drawHUDs = function(self, slide, ...)
-      if not (GoldCompat.battlePresentationEnabledFor(self)
-          or featureEnabled("hideNativeBattleUI")) then
-        return originalHUDs(self,slide,...)
-      end
-
-      -- Preserve the complete native/modded HUD draw lifecycle without letting
-      -- its pixels through. Some other mods also hang behavior off drawHUDs().
-      runDrawInvisible(originalHUDs,self,slide,...)
-    end
-  end
-
-  -- Trainer party count belongs to the OPENING battle presentation, not the
-  -- persistent battle HUD. Draw it directly after BattleState.draw() while
-  -- Gen1Recomp's own introBalls flag is active. This runs on the same battle
-  -- surface as the intro itself, after the suppressed native HUD has finished.
-  local originalBattleDraw = BattleState.draw
-  if originalBattleDraw then
-    BattleState.draw = function(self, ...)
-      local result=originalBattleDraw(self,...)
-
-      -- Safari does not consistently publish the ordinary battle.overlay
-      -- lifecycle callback. The state draw itself is authoritative proof that
-      -- this battle is live; retain it for the later custom HUD pass.
-      if GoldCompat.battlePresentationEnabledFor(self)
-          and GoldCompat.resolvedSafariState(self) then
-        State.activeBattle=self
-      end
-
-      if GoldCompat.battlePresentationEnabledFor(self)
-          and self.introBalls
-          and type(self.enemyParty)=="table"
-          and #self.enemyParty>0 then
-        local g=love.graphics
-        g.push("all")
-
-        local wide=false
-        if self.wideLayout then
-          local ok,value=pcall(self.wideLayout,self)
-          wide=ok and value or false
-        end
-
-        local x0=wide and 88 or 64
-        local y0=wide and 40 or 16
-        local gap=-8
-        local r=3.2
-
-        g.setColor(0.10,0.10,0.10,0.95)
-        g.rectangle("fill",wide and 41 or 17,wide and 46 or 22,54,2)
-
-        for i=1,6 do
-          local mon=self.enemyParty[i]
-          local cx=x0+(i-1)*gap
-          if mon then
-            local alive=(mon.hp or 0)>0
-            g.setColor(alive and {0.92,0.18,0.14,1}
-                             or {0.42,0.42,0.40,0.85})
-            g.arc("fill","pie",cx,y0,r,math.pi,math.pi*2)
-            g.setColor(0.96,0.96,0.92,1)
-            g.arc("fill","pie",cx,y0,r,0,math.pi)
-            g.setColor(0.08,0.08,0.08,1)
-            g.setLineWidth(0.8)
-            g.circle("line",cx,y0,r)
-            g.line(cx-r,y0,cx+r,y0)
-            g.setColor(0.98,0.98,0.95,1)
-            g.circle("fill",cx,y0,0.9)
-            g.setColor(0.08,0.08,0.08,1)
-            g.circle("line",cx,y0,0.9)
-          else
-            g.setColor(0.32,0.32,0.30,0.55)
-            g.setLineWidth(0.8)
-            g.circle("line",cx,y0,r)
-          end
-        end
-
-        g.pop()
-      end
-
-      return result
-    end
-  end
+  vanillaTextPatched=true
+  GoldCompat.installBattleUiFirewall()
 end
 
 -- -------------------------------------------------------------------------
@@ -4827,10 +4868,44 @@ function GoldCompat.frlgSelection(x, y, w, h)
 end
 
 local martUIPatched=false
+GoldCompat.openGen1MartSellBag=GoldCompat.openGen1MartSellBag
 
 local function installMartUI()
   if martUIPatched then return end
   martUIPatched=true
+
+  -- New launcher builds keep Gen I mart ownership in ShopMenu. Tag the root
+  -- menu at that authoritative constructor as well as through Menu.new below;
+  -- this makes the hanging BUY / SELL / QUIT flow resilient to other mods that
+  -- wrap generic Menu construction before or after us.
+  if ShopMenu and type(ShopMenu.new)=="function"
+      and not ShopMenu.__colosseumMartRootPatched then
+    ShopMenu.__colosseumMartRootPatched=true
+    local nativeShopNew=ShopMenu.new
+    ShopMenu.new=function(game,stock,onQuit,...)
+      local menu=nativeShopNew(game,stock,onQuit,...)
+      if menu then
+        menu.__gen3uiShopMain=true
+        if featureEnabled("revampedPokeMartUI") then menu.isOpaque=false end
+        -- Gen I SELL now enters the exact same categorized custom Bag used by
+        -- the field/start-menu flow.  ShopMenu's stock/buy transaction remains
+        -- native; only SELL presentation/selection is redirected to that Bag
+        -- state, with native Bag inventory/money as the authority.
+        if GoldCompat.generation=="gen1" and menu.items and menu.items[2] then
+          local sellRow=menu.items[2]
+          local nativeSellSelect=sellRow.onSelect
+          sellRow.keepOpen=true
+          sellRow.onSelect=function()
+            if featureEnabled("revampedPokeMartUI") and GoldCompat.openGen1MartSellBag then
+              return GoldCompat.openGen1MartSellBag(game)
+            end
+            if nativeSellSelect then return nativeSellSelect() end
+          end
+        end
+      end
+      return menu
+    end
+  end
 
   -- Quantity confirmation belongs to the same hanging Mart stack.
   QuantityBox.isOpaque=false
@@ -4853,6 +4928,9 @@ local function installMartUI()
 
   local originalQuantityDraw=QuantityBox.draw
   QuantityBox.draw=function(self)
+    if self.__gen3uiShopSellQuantity and featureEnabled("revampedPokeMartUI") then
+      return
+    end
     local pcItems=pcItemListStateInStack(self.game)
     if GoldCompat.itemPcPresentationEnabled() and pcItems then
       self.__gen3uiPCItemQuantity=true
@@ -5096,7 +5174,12 @@ local function gen1BagGoldAdapter(list)
     visibleRows=6,
   }
   function adapter:pocket() return pocket end
-  function adapter:description() return gen1BagDescription(list) end
+  function adapter:description()
+    if list.__gen3uiShopSellBag then
+      return list.__gen3uiShopSellMessage or "Choose an item to sell."
+    end
+    return gen1BagDescription(list)
+  end
 
   for _,row in ipairs(list.__gen3uiBagViewRows or {}) do
     local def=list.game.data.items and list.game.data.items[row.value]
@@ -5120,6 +5203,92 @@ local function gen1BagGoldAdapter(list)
     adapter.rows[#adapter.rows+1]=out
   end
   return adapter
+end
+
+
+-- Gen I Mart SELL using the real custom Bag state --------------------------------
+GoldCompat.openGen1MartSellBag=function(game)
+  if not (game and game.stack and game.save) then return end
+
+  local list=BagMenu.new(game,{})
+  if not list then return end
+  list.__gen3uiShopSellBag=true
+  list.isOpaque=false
+  list.title="SELL"
+  list.__gen3uiShopSellMessage="Choose an item to sell."
+
+  local function rebuildFlatItems()
+    local rebuilt={}
+    for _,id in ipairs(BagInventory.order(game.save) or {}) do
+      local count=game.save.inventory and game.save.inventory[id]
+      if count and count>0 then
+        local def=game.data and game.data.items and game.data.items[id]
+        rebuilt[#rebuilt+1]={
+          value=id,
+          label=(def and def.name) or id,
+          right="x"..tostring(count),
+        }
+      end
+    end
+    list.items=rebuilt
+    list.index=math.max(1,math.min(list.index or 1,math.max(1,#rebuilt)))
+  end
+
+  -- Preserve Bag SELECT/reorder semantics only outside Mart SELL; SELL should
+  -- never accidentally enter the field Bag's USE/TOSS machinery.
+  list.onSelectKey=nil
+  list.onChoose=function(item)
+    if not item then return end
+    local id=item.value
+    local def=game.data and game.data.items and game.data.items[id]
+    if not def or def.keyItem or tostring(id):find("^HM_") then
+      list.__gen3uiShopSellMessage="I can't put a price on that."
+      return
+    end
+
+    local unit=math.floor((tonumber(def.price) or 0)/2)
+    local maxQty=(game.save.inventory and game.save.inventory[id]) or 1
+    local qbox
+    qbox=QuantityBox.new(game,{
+      max=maxQty,
+      unitPrice=unit,
+      onDone=function(qty)
+        if not qty then
+          list.__gen3uiShopSellMessage="Choose an item to sell."
+          return
+        end
+        local total=unit*qty
+        list.__gen3uiShopSellMessage=("I can pay you ¥%d for that."):format(total)
+        local choice
+        choice=ChoiceBox.new(game,function(yes)
+          if not yes then
+            list.__gen3uiShopSellMessage="Choose an item to sell."
+            return
+          end
+          game.save.money=(tonumber(game.save.money) or 0)+total
+          BagInventory.remove(game.save,id,qty)
+          rebuildFlatItems()
+          gen1BagRefresh(list,nil)
+          list.__gen3uiShopSellMessage="Thank you!"
+        end)
+        if choice then
+          choice.__gen3uiShopSellChoice=true
+          choice.isOpaque=false
+          game.stack:push(choice)
+        end
+      end,
+    })
+    if qbox then
+      qbox.__gen3uiShopSellQuantity=true
+      qbox.isOpaque=false
+      game.stack:push(qbox)
+    end
+  end
+
+  rebuildFlatItems()
+  gen1BagRefresh(list,nil)
+  game.stack:push(list)
+  return list
 end
 
 local function installOverworldUI(mod)
@@ -5299,6 +5468,12 @@ local function installOverworldUI(mod)
     State.activeShopMenu = nil
     State.activeShopList = nil
     State.activeShopQuantity = nil
+    if GoldCompat.strictNativeUiEnabled() and featureEnabled("revampedOverworldMenus") then
+      self.isOpaque=false
+      State.activeGenericMenu=self
+      return
+    end
+    if State.activeGenericMenu==self then State.activeGenericMenu=nil end
     return originalMenuDraw(self)
   end
 
@@ -5541,7 +5716,7 @@ local function installOverworldUI(mod)
 
           -- TM/HMs must never pass through the generic field-item dispatcher.
           -- Run their actual boot -> target -> teach sequence directly.
-          if selectedDef and selectedDef.machine then
+          if selectedDef and selectedDef.machine and not self.__gen3uiShopSellBag then
             if not self.noSound and self.game and self.game.data then
               pcall(function()
                 require("src.core.Sound").play(self.game.data,"Press_AB")
@@ -5599,6 +5774,17 @@ local function installOverworldUI(mod)
 
   local originalListDraw = ListMenu.draw
   ListMenu.draw = function(self)
+    if self.__gen3uiPPMovePicker then
+      if GoldCompat.pokemonPresentationEnabled() then
+        self.isOpaque=false
+        State.activePPMoveList=self
+        State.activeGenericList=nil
+        return
+      end
+      if State.activePPMoveList==self then State.activePPMoveList=nil end
+      return originalListDraw(self)
+    end
+
     if self.__gen3uiShopList then
       if self.__gen3uiMartRenderFailed then
         return originalListDraw(self)
@@ -5658,6 +5844,12 @@ local function installOverworldUI(mod)
 
     State.activeBagMenu=nil
     State.activePCList=nil
+    if GoldCompat.strictNativeUiEnabled() and featureEnabled("revampedOverworldMenus") then
+      self.isOpaque=false
+      State.activeGenericList=self
+      return
+    end
+    if State.activeGenericList==self then State.activeGenericList=nil end
     return originalListDraw(self)
   end
 
@@ -5690,6 +5882,10 @@ local function installOverworldUI(mod)
   end
 
   SummaryMenu.update = function(self,dt)
+    -- Launcher API v2 resolves the visible stack before draw(). Keep the
+    -- replacement summary non-opaque during update as well so the overworld /
+    -- battle beneath it survives every frame, including the first handoff.
+    if GoldCompat.pokemonPresentationEnabled() then self.isOpaque=false end
     -- Both cartridge generations use the same direct three-tier contract in
     -- the overhaul: Left/Right select STATUS, MOVES, PROFILE; Up/Down switches
     -- the viewed party member; B returns. Native close behavior remains the
@@ -5813,6 +6009,7 @@ local function installOverworldUI(mod)
   end
 
   PartyMenu.update = function(self,dt)
+    if featureEnabled("colosseumPokemonMenu") then self.isOpaque=false end
     if not featureEnabled("colosseumPokemonMenu") then
       return originalPartyUpdate(self,dt)
     end
@@ -6056,6 +6253,44 @@ local function installOverworldUI(mod)
     end
   end
 
+  -- Strict-mode coverage for gameplay states that bypass Menu/ListMenu.
+  -- Native update/callback logic remains authoritative; only draw ownership is
+  -- replaced, and opacity is fixed at construction time for API-v2 stacks.
+  for _,spec in ipairs({
+      {"src.ui.TownMap","activeTownMap","revampedOverworldMenus"},
+      {"src.ui.PicBox","activePicBox","revampedOverworldMenus"},
+      {"src.ui.Diploma","activeDiploma","revampedPokedex"},
+      {"src.ui.HallOfFame","activeHallOfFame","revampedOverworldMenus"},
+      {"src.ui.BindingsMenu","activeBindings","revampedOptionsUI"},
+      {"src.ui.QuarantineReport","activeQuarantine","revampedOverworldMenus"},
+    }) do
+    local ok,cls=pcall(require,spec[1])
+    if ok and cls and type(cls.draw)=="function" and not cls.__colosseumStrictWrapped then
+      cls.__colosseumStrictWrapped=true
+      cls.__colosseumOriginalDraw=cls.draw
+      local key,toggle=spec[2],spec[3]
+      if type(cls.new)=="function" then
+        cls.__colosseumOriginalNew=cls.new
+        cls.new=function(...)
+          local obj=cls.__colosseumOriginalNew(...)
+          if obj and GoldCompat.strictNativeUiEnabled() and featureEnabled(toggle) then
+            obj.isOpaque=false
+          end
+          return obj
+        end
+      end
+      cls.draw=function(self,...)
+        if GoldCompat.strictNativeUiEnabled() and featureEnabled(toggle) then
+          self.isOpaque=false
+          State[key]=self
+          return
+        end
+        if State[key]==self then State[key]=nil end
+        return cls.__colosseumOriginalDraw(self,...)
+      end
+    end
+  end
+
   if mod and mod.log then
     pcall(function()
       mod.log("info", "Colosseum Inspired UI Overhaul: overworld menu layer active")
@@ -6217,31 +6452,6 @@ local function shopMoney(game)
   return tonumber(game and game.save and game.save.money) or 0
 end
 
-function GoldCompat.drawShopFrame(game,title)
-  local ox,oy,sc=finalCanvas()
-  local g=love.graphics
-  g.push("all")
-  g.translate(ox,oy)
-  g.scale(sc,sc)
-
-  g.setColor(0.94,0.93,0.87,1)
-  g.rectangle("fill",0,0,160,144)
-
-  g.setColor(0.08,0.08,0.08,1)
-  g.rectangle("fill",4,4,152,16)
-  g.setColor(0.99,0.985,0.955,1)
-  g.rectangle("fill",5,5,150,14)
-  g.pop()
-
-  finalText(title or "POKé MART",10,7,5.0,{0.06,0.06,0.06,1},ox,oy,sc)
-
-  local money=("¥%d"):format(shopMoney(game))
-  local mw=finalTextWidth(money,4.4,sc)
-  finalText(money,150-mw,8,4.4,{0.12,0.12,0.11,1},ox,oy,sc)
-
-  return ox,oy,sc
-end
-
 local function drawShopMainFinal(game,state)
   local g=love.graphics
   local ox,oy,sc=finalCanvas()
@@ -6303,59 +6513,127 @@ function GoldCompat.shopFirstVisible(state)
   return first,selected,rows
 end
 
+function GoldCompat.cleanItemDescription(desc)
+  desc=tostring(desc or "")
+  desc=desc:gsub("\r\n","\n"):gsub("\r","\n")
+
+  -- Gen II ROM text uses <NEXT> as a two-row cursor jump. Some descriptions
+  -- also hyphenate a word only to fit the original narrow Game Boy text box.
+  desc=desc:gsub("([%a]+)%-<NEXT>%-?([%a]+)",function(a,b)
+    if b:lower()=="type" then return a.."-"..b end
+    return a..b
+  end)
+  desc=desc:gsub("<NEXT>"," ")
+  desc=desc:gsub("\n"," ")
+  desc=desc:gsub("%s+"," ")
+  desc=desc:gsub("%s+([%.,!%?;:])","%1")
+  desc=desc:gsub("^%s+",""):gsub("%s+$","")
+
+  -- "(HOLD)" is cartridge/menu metadata. Turn it into readable prose.
+  if desc:match("%s*%(HOLD%)%s*$") then
+    desc=desc:gsub("%s*%(HOLD%)%s*$","")
+    desc=desc:gsub("[%s%.]+$","")
+    desc=desc.." when held."
+  end
+
+  return desc
+end
+
 local function drawShopListFinal(game,state)
+  -- BUY is a compact hanging list over the live overworld.  The native
+  -- ListMenu remains the transaction/input authority; this renderer only
+  -- replaces the old full-screen mart surface.
   local title=tostring(state.title or "SHOP"):upper()
-  local ox,oy,sc=GoldCompat.drawShopFrame(game,title=="SELL" and "POKé MART — SELL" or "POKé MART — BUY")
+  if title=="SELL" then
+    return drawShopSellBagFinal(game,state)
+  end
+
+  local ox,oy,sc=finalCanvas()
   local g=love.graphics
+  local first,selected,rows=GoldCompat.shopFirstVisible(state)
+  local visible=0
+  for row=1,rows do if state.items and state.items[first+row-1] then visible=visible+1 end end
+  visible=math.max(1,visible)
+
+  local rowH=13
+  local x=63
+  local y=14
+  local w=92
+  -- Keep the BUY list and selected-item description as two distinct hanging
+  -- surfaces. The list no longer reserves footer rows for description text.
+  local h=22+visible*rowH+7
 
   g.push("all")
   g.translate(ox,oy)
   g.scale(sc,sc)
-  drawShopPanel(6,25,148,78,false)
+  g.setColor(0.01,0.02,0.02,0.34)
+  roundedRect("fill",x+2,y+2,w,h,6)
+  g.setColor(0.025,0.065,0.068,0.94)
+  roundedRect("fill",x,y,w,h,6)
+  g.setColor(0.38,0.58,0.56,0.96)
+  roundedRect("line",x,y,w,h,6)
+
+  g.setColor(0.015,0.035,0.036,0.98)
+  roundedRect("fill",x+5,y+5,w-10,13,4)
+
+  for row=1,visible do
+    local idx=first+row-1
+    local yy=y+22+(row-1)*rowH
+    if idx==selected then
+      g.setColor(0.64,0.13,0.075,0.92)
+      roundedRect("fill",x+5,yy-1,w-10,rowH-1,4)
+    end
+  end
   g.pop()
 
-  local first,selected,rows=GoldCompat.shopFirstVisible(state)
-  for row=1,rows do
+  finalText("POKé MART — BUY",x+9,y+7,3.55,{0.72,0.92,0.85,1},ox,oy,sc)
+  local money=("¥%d"):format(shopMoney(game))
+  local mw=finalTextWidth(money,3.45,sc)
+  finalText(money,x+w-8-mw,y+7,3.45,{0.72,0.92,0.85,1},ox,oy,sc)
+
+  for row=1,visible do
     local idx=first+row-1
     local item=state.items and state.items[idx]
     if item then
-      local y=31+(row-1)*14
-      if idx==selected then
-        g.push("all"); g.translate(ox,oy); g.scale(sc,sc)
-        g.setColor(0.10,0.10,0.10,1)
-        roundedRect("fill",11,y-2,138,12,2)
-        g.setColor(0.70,0.56,0.28,1)
-        roundedRect("line",12,y-1,136,10,2)
-        g.pop()
-      end
-      finalText(tostring(item.label or ""),18,y,3.9,
-        idx==selected and {0.98,0.97,0.92,1} or {0.07,0.07,0.07,1},
-        ox,oy,sc,"left",85)
+      local yy=y+22+(row-1)*rowH
+      local selectedRow=idx==selected
+      finalTextFitted(tostring(item.label or ""),x+10,yy+1,3.7,2.7,
+        selectedRow and {1,1,1,1} or {0.73,0.86,0.81,1},
+        ox,oy,sc,"left",54,rowH-2)
       if item.right then
-        local rw=finalTextWidth(tostring(item.right),3.9,sc)
-        finalText(tostring(item.right),145-rw,y,3.9,
-          idx==selected and {0.98,0.97,0.92,1} or {0.12,0.12,0.11,1},
-          ox,oy,sc)
+        local right=tostring(item.right)
+        local rw=finalTextWidth(right,3.45,sc)
+        finalText(right,x+w-9-rw,yy+1,3.45,
+          selectedRow and {1,1,1,1} or {0.58,0.76,0.70,1},ox,oy,sc)
       end
     end
   end
 
-  g.push("all"); g.translate(ox,oy); g.scale(sc,sc)
-  g.setColor(0.08,0.08,0.08,1)
-  g.rectangle("fill",4,108,152,32)
-  g.setColor(0.99,0.985,0.95,1)
-  g.rectangle("fill",6,110,148,28)
+  -- The selected item's description gets its own dedicated hanging glass
+  -- card directly beneath BUY. This avoids footer/help text colliding with
+  -- the item rows and keeps the hierarchy consistent with the Gen I Mart.
+  local footer=GoldCompat.cleanItemDescription(state.footer or "")
+  if footer=="" then footer="Select an item." end
+  local dx,dy,dw,dh=x,y+h+3,w,25
+
+  g.push("all")
+  g.translate(ox,oy)
+  g.scale(sc,sc)
+  g.setColor(0.01,0.02,0.02,0.30)
+  roundedRect("fill",dx+2,dy+2,dw,dh,5)
+  g.setColor(0.025,0.065,0.068,0.92)
+  roundedRect("fill",dx,dy,dw,dh,5)
+  g.setColor(0.38,0.58,0.56,0.96)
+  roundedRect("line",dx,dy,dw,dh,5)
+  g.setColor(0.015,0.035,0.036,0.96)
+  roundedRect("fill",dx+5,dy+5,dw-10,dh-10,3)
   g.pop()
 
-  local footer=tostring(state.footer or "Take your time.")
-  local pages=TextBox.paginate(footer)
-  local flat={}
-  for _,page in ipairs(pages or {}) do
-    for _,line in ipairs(page) do flat[#flat+1]=line end
-  end
-  local firstLine=math.max(1,#flat-1)
-  for i=firstLine,#flat do
-    finalText(flat[i],11,116+(i-firstLine)*9,3.7,{0.06,0.06,0.06,1},ox,oy,sc)
+  local pages=TextBox.paginate(footer,28)
+  local lines=(pages and pages[1]) or {}
+  for i=1,math.min(2,#lines) do
+    finalTextFitted(tostring(lines[i]),dx+8,dy+6+(i-1)*8,2.65,1.95,
+      {0.84,0.94,0.90,1},ox,oy,sc,"left",dw-16,8)
   end
 end
 
@@ -6530,8 +6808,15 @@ local function drawBagFinal(game, state)
   if GoldCompat.generation=="gen1"
       and state and state.__gen3uiCategorizedBag
       and GoldCompat.drawGoldPack then
-    return GoldCompat.drawGoldPack(gen1BagGoldAdapter(state),
+    local result=GoldCompat.drawGoldPack(gen1BagGoldAdapter(state),
       love.graphics.getWidth(),love.graphics.getHeight(),false)
+    if state.__gen3uiShopSellBag then
+      local ox,oy,sc=finalCanvas()
+      finalText("POKé MART — SELL",5,8,3.2,{0.72,0.92,0.85,1},ox,oy,sc)
+      local money=("¥%d"):format(shopMoney(game))
+      finalText(money,5,16,3.7,{0.84,0.94,0.90,1},ox,oy,sc)
+    end
+    return result
   end
 
   -- Legacy fallback for non-Gen1 callers.
@@ -6978,8 +7263,12 @@ function GoldCompat.drawColosseumParty(game, state)
   if state.__gen3uiBattleMoveParty and battleLearn and battleLearn.selecting then
     learn=battleLearn
   end
+  local ppPicker=state.__gen3uiPPMoveParty and State.activePPMoveList or nil
+  if ppPicker then
+    learn={selecting=true,mon=selectedMon,index=ppPicker.index or 1,__ppItem=true}
+  end
   local replacing=learn and learn.selecting and learn.mon==selectedMon
-  if replacing then
+  if replacing and not learn.__ppItem then
     local newDef=game.data and game.data.moves and game.data.moves[learn.newMoveId]
     local newName=(newDef and newDef.name)
       or GoldCompat.humanizeIdentifier(learn.newMoveId or "MOVE")
@@ -8604,7 +8893,9 @@ local function drawPartyFinal(game, state)
     promptIntegrated=true
   end
 
-  if promptLearn and promptIntegrated then
+  if state.__gen3uiPPMoveParty and State.activePPMoveList then
+    prompt = "Choose a move for the item."
+  elseif promptLearn and promptIntegrated then
     local moveId = promptLearn.newMoveId
     local nd = moveId and game.data.moves[moveId] or nil
     local nn = (nd and nd.name)
@@ -10380,19 +10671,6 @@ function GoldCompat.isNicknamePromptBox(box)
     and (all:find("GIVE",1,true)~=nil or all:find("NICKNAME",1,true)~=nil)
 end
 
-function GoldCompat.findStarterPromptBox(game)
-  local states=game and game.stack and game.stack.states
-  if type(states)~="table" then return nil,nil end
-  for i=#states,1,-1 do
-    local state=states[i]
-    if state and (state.isTextBox or getmetatable(state)==TextBox) then
-      local species=GoldCompat.starterSpeciesFromTextBox(state)
-      if species then return state,species end
-    end
-  end
-  return nil,nil
-end
-
 local function starterTypeLabel(value)
   if type(value)=="table" then value=value.name or value.id end
   local label=GoldCompat.humanizeIdentifier(value or "---"):upper()
@@ -10517,6 +10795,36 @@ function GoldCompat.drawSafariChoiceFinal(box)
   return true
 end
 
+function GoldCompat.drawGen1ChoiceFinal(box)
+  local selected=math.max(1,math.min(2,tonumber(box and box.index) or 1))
+  local ox,oy,sc=safeFullCanvas()
+  local G=love.graphics
+  -- Ordinary Gen I YES/NO prompts now use the same proven hanging-state
+  -- contract as Safari rather than a native-paper fallback. The native
+  -- ChoiceBox remains the sole input/callback authority.
+  local x,y,w,h=104,43,45,48
+  G.push("all"); G.translate(ox,oy); G.scale(sc,sc)
+  G.setColor(0,0,0,0.34); roundedRect("fill",x+2,y+3,w,h,6)
+  G.setColor(0.010,0.050,0.050,0.96); roundedRect("fill",x,y,w,h,6)
+  G.setColor(0.24,0.55,0.52,0.98); G.setLineWidth(1.05)
+  roundedRect("line",x,y,w,h,6)
+  G.setColor(0.020,0.105,0.082,0.95); roundedRect("fill",x+4,y+4,w-8,10,3)
+  for i=1,2 do
+    local yy=y+17+(i-1)*11
+    if selected==i then
+      G.setColor(0.075,0.285,0.275,0.97)
+      roundedRect("fill",x+7,yy,w-14,9,2)
+      G.setColor(1.00,0.34,0.16,1)
+      G.polygon("fill",x+10,yy+4.5,x+6,yy+1.5,x+6,yy+7.5)
+    end
+  end
+  G.pop()
+  finalText("CONFIRM",x+9,y+7,1.9,{0.52,1.00,0.69,1},ox,oy,sc)
+  finalText("YES",x+17,y+18.5,2.5,selected==1 and {1,1,1,1} or {0.68,0.82,0.78,1},ox,oy,sc)
+  finalText("NO",x+17,y+29.5,2.5,selected==2 and {1,1,1,1} or {0.68,0.82,0.78,1},ox,oy,sc)
+  return true
+end
+
 function GoldCompat.drawChoiceThemeFinal(box)
   local saveBox=box and box.__colosseumSavePrompt
     or GoldCompat.__activeSavePromptBox
@@ -10534,6 +10842,10 @@ function GoldCompat.drawChoiceThemeFinal(box)
   if box and (box.__colosseumSafariChoice or GoldCompat.safariContext(box.game))
       and featureEnabled("revampedDialogueBoxes") then
     return GoldCompat.drawSafariChoiceFinal(box)
+  end
+  if box and GoldCompat.generation=="gen1"
+      and featureEnabled("revampedDialogueBoxes") then
+    return GoldCompat.drawGen1ChoiceFinal(box)
   end
   local g = love.graphics
   local sw,sh = g.getDimensions()
@@ -10620,9 +10932,188 @@ function GoldCompat.drawChoiceThemeFinal(box)
       or (colosseum and {0.80,0.86,0.83,1} or {0.04,0.04,0.04,1}))
   g.pop()
 end
+function GoldCompat.clonePaletteZones(zones)
+  if type(zones)~="table" then return zones end
+  local out={}
+  for i,zone in ipairs(zones) do
+    if type(zone)=="table" then
+      local copy={}
+      for key,value in pairs(zone) do
+        if key=="colors" and type(value)=="table" then
+          local colors={}
+          for ci,color in ipairs(value) do
+            if type(color)=="table" then
+              colors[ci]={color[1],color[2],color[3],color[4]}
+            else
+              colors[ci]=color
+            end
+          end
+          copy[key]=colors
+        else
+          copy[key]=value
+        end
+      end
+      out[i]=copy
+    else
+      out[i]=zone
+    end
+  end
+  return out
+end
+
+function GoldCompat.isDialogueTextState(state)
+  if not state then return false end
+  if state.isTextBox or getmetatable(state)==TextBox then return true end
+  -- Structural fallback for API-v2 proxies/wrappers that intentionally hide
+  -- the concrete metatable from another mod's sandbox.
+  return type(state.pages)=="table" and type(state.shown)=="table"
+    and state.boxTx~=nil and state.boxTy~=nil and state.game~=nil
+end
+
+function GoldCompat.isDialogueChoiceState(state,owner)
+  if not state then return false end
+  if getmetatable(state)==ChoiceBox then return true end
+  return GoldCompat.isDialogueTextState(owner) and type(state.onChoose)=="function"
+    and state.index~=nil and state.tx~=nil and state.ty~=nil and state.game~=nil
+end
+
+function GoldCompat.dialoguePaletteLockActive(game)
+  local states=game and game.stack and game.stack.states
+  local top=type(states)=="table" and states[#states] or nil
+  local owner=type(states)=="table" and states[#states-1] or nil
+  local latched=GoldCompat.__gen1DialoguePaletteOwner
+  if latched and not stateExistsInStack(game,latched) then
+    GoldCompat.__gen1DialoguePaletteOwner=nil
+    latched=nil
+  end
+  local structuralOwner=GoldCompat.isDialogueTextState(top) and top
+    or (GoldCompat.isDialogueChoiceState(top,owner) and top) or nil
+  if structuralOwner then
+    GoldCompat.__gen1DialoguePaletteOwner=structuralOwner
+    latched=structuralOwner
+  end
+  return latched~=nil or State.activeDialogueBox~=nil
+    or State.activeChoiceBox~=nil or GoldCompat.isDialogueTextState(top)
+    or GoldCompat.isDialogueChoiceState(top,owner)
+end
+
+-- Photosensitivity safety guard for API-v2 Gen I.  Some script TextBoxes make
+-- the palette compositor alternate between the map's normal zone set and the
+-- saturated OG-Red boot palette.  The bad state lasts for the whole text page
+-- and ends when ChoiceBox appears, so recomputing or pattern-matching the bad
+-- palette cannot make the transition safe.  Freeze the last settled, pre-box
+-- zones for the complete themed dialogue/choice flow instead.  A dedicated
+-- owner latch survives render frames that occur between fixed updates; it is
+-- released only after that state actually leaves the authoritative stack.
+function GoldCompat.repairGen1TransientZones(game,zones)
+  if GoldCompat.generation~="gen1" or type(zones)~="table" then return zones end
+  if not featureEnabled("revampedDialogueBoxes") then
+    GoldCompat.__lastStableGen1Zones=GoldCompat.clonePaletteZones(zones)
+    return zones
+  end
+
+  if GoldCompat.dialoguePaletteLockActive(game) then
+    local stable=GoldCompat.__lastStableGen1Zones
+    if type(stable)=="table" and #stable>0 then
+      return GoldCompat.clonePaletteZones(stable)
+    end
+    -- A dialogue opened before this mod observed a normal gameplay frame.
+    -- Do not invent a palette; retain the engine result until a stable frame
+    -- can be cached. This is restricted to unusual mid-load enable/reload.
+    return zones
+  end
+
+  GoldCompat.__lastStableGen1Zones=GoldCompat.clonePaletteZones(zones)
+  return zones
+end
+
+-- The current renderer has two independent palette inputs: `zones` for the
+-- UI canvas and `worldZones` for the overworld canvas. render.zones can only
+-- change the former. During Gen I TextBox ownership, Game:draw can
+-- intermittently pass nil for worldZones; Renderer:endFrame then falls back
+-- to the UI zones, producing the full-screen red flashes seen in captures.
+--
+-- RED++ deliberately uses an EMPTY worldZones table as a meaningful sentinel:
+-- the overworld atlas is already true-color, so Renderer must plain-blit it
+-- instead of running the UI shade-remap shader over it. Never use #zones > 0
+-- as the validity test here. An empty table is the most important stable value
+-- to retain; only nil/non-table means the world-specific input is absent.
+function GoldCompat.installGen1WorldZoneSafety()
+  if GoldCompat.__gen1WorldZoneSafetyInstalled then return end
+  local ok,Renderer=pcall(require,"src.render.Renderer")
+  if not (ok and Renderer and type(Renderer.endFrame)=="function") then return end
+  GoldCompat.__gen1WorldZoneSafetyInstalled=true
+  local originalEndFrame=Renderer.endFrame
+  Renderer.endFrame=function(renderer,zones,worldZones,...)
+    local game=GoldCompat.game
+    if GoldCompat.generation=="gen1" and game
+        and featureEnabled("revampedDialogueBoxes") then
+      local locked=GoldCompat.dialoguePaletteLockActive(game)
+      if locked then
+        if type(GoldCompat.__lastStableGen1WorldZones)=="table" then
+          if type(worldZones)~="table"
+              and not GoldCompat.__loggedWorldZoneSafety then
+            GoldCompat.__loggedWorldZoneSafety=true
+            if modRef and modRef.log then
+              modRef.log:info("Colosseum UI 1.1.0: blocked missing Gen I dialogue worldZones fallback")
+            end
+          end
+          worldZones=GoldCompat.clonePaletteZones(
+            GoldCompat.__lastStableGen1WorldZones)
+        elseif type(worldZones)=="table" then
+          -- First observed frame may already contain a newly-pushed TextBox.
+          -- Its table (including RED++'s intentional empty sentinel) is a
+          -- valid seed; only a later nil causes the dangerous UI-zone fallback.
+          GoldCompat.__lastStableGen1WorldZones=
+            GoldCompat.clonePaletteZones(worldZones)
+        end
+      elseif type(worldZones)=="table" then
+        GoldCompat.__lastStableGen1WorldZones=
+          GoldCompat.clonePaletteZones(worldZones)
+      end
+    end
+    return originalEndFrame(renderer,zones,worldZones,...)
+  end
+end
+
+function GoldCompat.installGen1TransientPaletteGuard()
+  if GoldCompat.__gen1TransientPaletteGuard then return end
+  GoldCompat.__gen1TransientPaletteGuard=true
+  local ok,OverworldState=pcall(require,"src.world.OverworldController")
+  if not (ok and OverworldState and type(OverworldState.stepHealAnim)=="function") then return end
+  local nativeStepHealAnim=OverworldState.stepHealAnim
+  OverworldState.stepHealAnim=function(ha,...)
+    local result=nativeStepHealAnim(ha,...)
+    -- API-v2 launcher currently reuses the heal-machine palette shader in a
+    -- way that can tint the complete Gen I frame red during FlashSprite8Times.
+    -- Keep the machine art on its normal palette rather than exposing that
+    -- broken whole-frame flash. Gameplay timing/callbacks are untouched.
+    if GoldCompat.generation=="gen1" and ha then ha.visible=true end
+    return result
+  end
+end
+
 local function installDialogueThemeDirect(mod)
+  GoldCompat.installGen1TransientPaletteGuard()
+  GoldCompat.installGen1WorldZoneSafety()
+  -- API v2 asks opacity before draw(), so these two primitives must advertise
+  -- overlay ownership at class level. Older launcher builds effectively treated
+  -- the absence of isOpaque this way; making it explicit prevents one-frame
+  -- red/black base-screen flashes during chained dialogue and menu handoffs.
+  TextBox.isOpaque=false
+  ChoiceBox.isOpaque=false
   local originalTextUpdate=TextBox.update
   TextBox.update=function(self,dt)
+    -- Gen I can complete and replace script-owned dialogue states between the
+    -- main-screen draw and the final HUD pass.  Under API v2 that made our
+    -- presentation ownership arrive one frame late, exposing the palette/base
+    -- canvas as a red flash.  Claim the live dialogue during UPDATE instead of
+    -- waiting for TextBox.draw; input/typewriter behavior remains native.
+    if GoldCompat.generation=="gen1" and featureEnabled("revampedDialogueBoxes") then
+      self.isOpaque=false
+      State.activeDialogueBox=self
+      GoldCompat.__gen1DialoguePaletteOwner=self
+    end
     if featureEnabled("revampedSaveUI")
         and GoldCompat.isGen1SavePromptBox(self) then
       GoldCompat.__activeSavePromptBox=self
@@ -10656,6 +11147,13 @@ local function installDialogueThemeDirect(mod)
   local originalChoiceNew=ChoiceBox.new
   ChoiceBox.new=function(game,onChoose,opts)
     local choice=originalChoiceNew(game,onChoose,opts)
+    -- Instance-level opacity is intentional.  Other UI/mod wrappers may copy
+    -- or shadow class fields, while StateStack.visibleBase reads the instance
+    -- visible through __index.  Pinning it here removes the Gen I one-frame
+    -- opaque handoff without changing ChoiceBox callbacks or hold timing.
+    if choice and featureEnabled("revampedDialogueBoxes") then
+      choice.isOpaque=false
+    end
     if GoldCompat.__activeSavePromptBox then
       choice.__colosseumSavePrompt=GoldCompat.__activeSavePromptBox
     end
@@ -10716,6 +11214,11 @@ local function installDialogueThemeDirect(mod)
 
   local originalChoiceUpdate=ChoiceBox.update
   ChoiceBox.update=function(self,dt)
+    if GoldCompat.generation=="gen1" and featureEnabled("revampedDialogueBoxes") then
+      self.isOpaque=false
+      State.activeChoiceBox=self
+      GoldCompat.__gen1DialoguePaletteOwner=self
+    end
     if self.pending==nil then
       local input=self.game and self.game.input
       if self.__colosseumStarterSpecies
@@ -10762,6 +11265,9 @@ local function installDialogueThemeDirect(mod)
     -- Revamped mode is exclusive: suppress the vanilla box completely.
     -- Mark this TextBox for final-HUD rendering in the current frame.
     State.activeDialogueBox = self
+    if GoldCompat.generation=="gen1" then
+      GoldCompat.__gen1DialoguePaletteOwner=self
+    end
 
     -- Preserve the only draw-time state mutation from vanilla TextBox.draw:
     -- the 8px scroll animation decays by 2px per rendered frame.
@@ -10795,6 +11301,9 @@ local function installDialogueThemeDirect(mod)
 
     -- Same exclusive behavior for YES / NO and other ChoiceBox prompts.
     State.activeChoiceBox = self
+    if GoldCompat.generation=="gen1" then
+      GoldCompat.__gen1DialoguePaletteOwner=self
+    end
   end
 
   if mod.log then
@@ -10923,7 +11432,37 @@ local function installPCIntegration()
     local list=originalListMenuNew(game,title,items,opts,...)
     local upperTitle=tostring(title or ""):upper()
 
-    if list and (upperTitle=="POKéDEX" or upperTitle=="POKEDEX") then
+    -- Gen I PP UP / ETHER / MAX ETHER all enter the same native ListMenu
+    -- titled exactly "Which move?" after the Party target is chosen. Keep that
+    -- authoritative list/callback, but make it a child of our Party deck instead
+    -- of allowing the cartridge-white move picker to take over the screen.
+    if list and GoldCompat.generation=="gen1" and upperTitle=="WHICH MOVE?"
+        and GoldCompat.pokemonPresentationEnabled() then
+      list.__gen3uiPPMovePicker=true
+      list.isOpaque=false
+      local party=State.activeItemTargetParty or State.activeParty
+      list.__gen3uiPPParty=party
+      if party then
+        party.__gen3uiPPMoveParty=true
+        party.isOpaque=false
+      end
+      local nativePPUpdate=list.update
+      list.update=function(self,dt)
+        self.isOpaque=false
+        local input=self.game and self.game.input
+        local pressed=input and input.pressed
+        if type(pressed)=="table" then
+          local savedUp,savedDown=pressed.up,pressed.down
+          if pressed.left and not pressed.up then pressed.up=pressed.left end
+          if pressed.right and not pressed.down then pressed.down=pressed.right end
+          local ok,result=pcall(nativePPUpdate,self,dt)
+          pressed.up,pressed.down=savedUp,savedDown
+          if not ok then error(result) end
+          return result
+        end
+        return nativePPUpdate(self,dt)
+      end
+    elseif list and (upperTitle=="POKéDEX" or upperTitle=="POKEDEX") then
       list.__gen3uiPokedex=true
       if featureEnabled("revampedPokedex") then list.isOpaque=false end
       DexUI.active=list
@@ -12598,11 +13137,6 @@ function GoldCompat.locationBannerMapVisible(game,mapId)
   if def.outdoor==true then return true end
   local tileset=tostring(def.tileset or ""):upper()
   return GoldCompat.LOCATION_BANNER_GEN1_SURFACES[tileset] and true or false
-end
-
-function GoldCompat.locationBannerLabel(game,mapId)
-  local _,label=GoldCompat.locationBannerArea(game,mapId)
-  return label
 end
 
 function GoldCompat.locationBannerForeground(game)
@@ -14791,7 +15325,7 @@ function GoldCompat.drawGoldPack(pack,winW,winH,embedded)
     local ok,v=pcall(pack.description,pack)
     if ok then desc=v end
   end
-  desc=tostring(desc or "Choose an item."):gsub("<NEXT>"," "):gsub("%s+"," ")
+  desc=GoldCompat.cleanItemDescription(desc or "Choose an item.")
   local f=font(2.55*UI_TEXT_SCALE*GoldCompat.userTextScale())
   local _,wrapped=f:getWrap(desc,w-18)
   for i=1,math.min(2,#wrapped) do
@@ -15025,7 +15559,7 @@ function GoldCompat.drawGoldPack(pack,winW,winH,embedded)
       local ok,v=pcall(pack.description,pack)
       if ok then desc=v end
     end
-    desc=tostring(desc or "Choose an item."):gsub("<NEXT>"," "):gsub("%s+"," ")
+    desc=GoldCompat.cleanItemDescription(desc or "Choose an item.")
     local f=font(2.5*UI_TEXT_SCALE*GoldCompat.userTextScale())
     local _,wrapped=f:getWrap(desc,descW-10)
     for i=1,math.min(3,#wrapped) do
@@ -15149,7 +15683,8 @@ end
 
 function GoldCompat.flowSelectedIndex(flow)
   return math.max(1,tonumber(flow and (flow.index or flow.listIndex or
-    flow.row or flow.cursorY or flow.optionIndex or flow.modeIndex)) or 1)
+    flow.cursor or flow.row or flow.cursorY or flow.optionIndex or
+    flow.modeIndex)) or 1)
 end
 
 function GoldCompat.drawFlowShell(title,x,y,w,h,ox,oy,sc)
@@ -15831,8 +16366,10 @@ function GoldCompat.drawGenericFlow(flow,kind)
   GoldCompat.drawFlowMessage(lines,flow.confirm,x+5,y+h-35,w-10,ox,oy,sc)
   finalTextFitted("A: SELECT",x+8,y+h-6,1.75,1.10,
     {0.51,0.72,0.68,1},ox,oy,sc,"left",42,5.5)
-  finalTextFitted("B: BACK",x+w-35,y+h-6,1.75,1.10,
-    {0.51,0.72,0.68,1},ox,oy,sc,"right",27,5.5)
+  if kind~="name-pick" then
+    finalTextFitted("B: BACK",x+w-35,y+h-6,1.75,1.10,
+      {0.51,0.72,0.68,1},ox,oy,sc,"right",27,5.5)
+  end
 end
 
 function GoldCompat.flowPresentationEnabled(kind)
@@ -16580,110 +17117,147 @@ end
 function GoldCompat.drawGoldMart(mart,winW,winH)
   local ox,oy,sc=finalCanvas()
   local G=love.graphics
-  local hanging=(mart.phase=="top" or mart.phase=="outro"
-    or mart.phase=="intro")
+  local phase=mart.phase
 
-  if not hanging then
+  local function panel(x,y,w,h)
     G.push("all"); G.translate(ox,oy); G.scale(sc,sc)
-    G.setColor(0.94,0.93,0.87,1); G.rectangle("fill",0,0,160,144)
-    G.setColor(0.08,0.08,0.08,1); G.rectangle("fill",4,4,152,16)
-    G.setColor(0.99,0.985,0.955,1); G.rectangle("fill",5,5,150,14)
+    G.setColor(0.01,0.02,0.02,0.34)
+    roundedRect("fill",x+2,y+2,w,h,6)
+    G.setColor(0.025,0.065,0.068,0.94)
+    roundedRect("fill",x,y,w,h,6)
+    G.setColor(0.38,0.58,0.56,0.96)
+    roundedRect("line",x,y,w,h,6)
+    G.setColor(0.015,0.035,0.036,0.96)
+    roundedRect("fill",x+5,y+5,w-10,h-10,4)
     G.pop()
-
-    GoldCompat.panelText("POKé MART",10,7,5.0,{0.06,0.06,0.06,1})
-    GoldCompat.panelText(("¥%d"):format(mart.money and mart:money() or 0),
-      121,8,4.0,{0.12,0.12,0.11,1},"right",29)
   end
 
-  if mart.phase=="top" or mart.phase=="outro" then
+  local function selection(x,y,w,h)
+    G.push("all"); G.translate(ox,oy); G.scale(sc,sc)
+    G.setColor(0.64,0.13,0.075,0.94)
+    roundedRect("fill",x,y,w,h,4)
+    G.pop()
+  end
+
+  -- STANDARD root: compact hanging choice menu over the live shop.
+  if phase=="top" or phase=="outro" then
     local labels={"BUY","SELL","EXIT"}
     local x,y,w,h=94,25,58,49
-    G.push("all"); G.translate(ox,oy); G.scale(sc,sc)
-    drawShopPanel(x,y,w,h,false)
-    for i=1,3 do
-      local yy=y+8+(i-1)*13
-      if i==(mart.topIndex or 1) and mart.phase=="top" then
-        G.setColor(0.10,0.10,0.09,1)
-        roundedRect("fill",x+5,yy-1,w-10,10,1.5)
-      end
+    panel(x,y,w,h)
+    if phase=="top" then
+      local yy=y+8+((mart.topIndex or 1)-1)*13
+      selection(x+5,yy-1,w-10,10)
     end
-    G.pop()
     for i,label in ipairs(labels) do
       GoldCompat.panelText(label,x+12,y+9+(i-1)*13,4.0,
-        i==(mart.topIndex or 1) and mart.phase=="top"
-          and {1,1,1,1} or {0.06,0.06,0.06,1})
+        i==(mart.topIndex or 1) and phase=="top"
+          and {1,1,1,1} or {0.73,0.86,0.81,1})
     end
-  elseif mart.phase=="sell" and mart.pack then
-    GoldCompat.drawGoldPack(mart.pack,winW,winH,true)
+
+  -- SELL and every SELL child phase keep the custom Bag visible underneath.
+  elseif (phase=="sell" or phase=="sellQuantity") and mart.pack then
+    GoldCompat.drawGoldPack(mart.pack,winW,winH,false)
+
+  -- BUY and BUY quantity/confirmation use one continuous hanging list.
   else
-    G.push("all"); G.translate(ox,oy); G.scale(sc,sc)
-    drawShopPanel(6,25,148,79,false)
-    G.pop()
+    local px,py,pw,ph=63,20,92,91
+    panel(px,py,pw,ph)
+    GoldCompat.panelText("POKé MART — BUY",px+9,py+7,3.3,{0.72,0.92,0.85,1})
+    local money=("¥%d"):format(mart.money and mart:money() or 0)
+    GoldCompat.panelText(money,px+pw-33,py+7,3.05,{0.72,0.92,0.85,1},"right",25)
+
     local entries=mart.entries or {}
     local first=(mart.scroll or 0)+1
+    local total=#entries+1
     for r=1,5 do
       local idx=first+r-1
-      local yy=31+(r-1)*14
-      local entry=entries[idx]
+      if idx>total then break end
+      local yy=py+22+(r-1)*12
       local selected=idx==(mart.index or 1)
-      if entry then
-        if selected then
-          G.push("all"); G.translate(ox,oy); G.scale(sc,sc)
-          G.setColor(0.10,0.10,0.09,1); roundedRect("fill",11,yy-2,138,12,2)
-          G.pop()
+      if selected then selection(px+5,yy-1,pw-10,10) end
+      if idx<=#entries then
+        local entry=entries[idx]
+        GoldCompat.panelText(entry.name or entry.id,px+10,yy,2.8,
+          selected and {1,1,1,1} or {0.73,0.86,0.81,1},"left",53)
+        GoldCompat.panelText(("¥%d"):format(entry.price or 0),px+pw-30,yy,2.55,
+          selected and {1,1,1,1} or {0.58,0.76,0.70,1},"right",22)
+      else
+        GoldCompat.panelText("CANCEL",px+10,yy,2.8,
+          selected and {1,1,1,1} or {0.73,0.86,0.81,1})
+      end
+    end
+
+    -- Selected item description owns a separate hanging glass card directly
+    -- beneath BUY. Keep the item list itself free of footer/help text.
+    if not (mart.message or mart.confirm) and phase~="buyQuantity" and mart.description then
+      local ok,d=pcall(mart.description,mart)
+      if ok and d and d~="" then
+        d=GoldCompat.cleanItemDescription(d)
+        local dx,dy,dw,dh=px,py+ph+3,pw,25
+        panel(dx,dy,dw,dh)
+        local pages=TextBox.paginate(d,28)
+        local page=(pages and pages[1]) or {d}
+        for i=1,math.min(2,#page) do
+          GoldCompat.panelText(tostring(page[i]),dx+9,dy+6+(i-1)*8,2.55,
+            {0.84,0.94,0.90,1},"left",dw-18)
         end
-        GoldCompat.panelText(entry.name or entry.id,18,yy,3.9,
-          selected and {1,1,1,1} or {0.07,0.07,0.07,1},"left",85)
-        GoldCompat.panelText(("¥%d"):format(entry.price or 0),116,yy,3.6,
-          selected and {1,1,1,1} or {0.12,0.12,0.11,1},"right",31)
-      elseif idx==#entries+1 then
-        GoldCompat.panelText("CANCEL",18,yy,3.9,
-          selected and {1,1,1,1} or {0.07,0.07,0.07,1})
       end
     end
   end
 
-  -- The mart's own speech/message/confirmation state remains authoritative.
+  -- Only show the root clerk line while the root menu is actually active.
+  -- Message/confirm pages belong to their current child flow. Never allow
+  -- stale topLines to leak under the Bag or BUY list.
   local lines=nil
   if mart.message and mart.message.pages then
     lines=mart.message.pages[mart.message.page or 1]
   elseif mart.confirm and mart.confirm.pages then
     lines=mart.confirm.pages[mart.confirm.page or 1]
-  elseif mart.topLines then
+  elseif (phase=="top" or phase=="outro") and mart.topLines then
     lines=mart.topLines
-  elseif mart.description then
-    local ok,d=pcall(mart.description,mart)
-    if ok and d then lines={d} end
   end
+
   if lines then
     if type(lines)=="string" then lines={lines} end
-    local bx,by,bw,bh=4,109,152,31
-    if hanging then bx,by,bw,bh=8,108,144,29 end
-    G.push("all"); G.translate(ox,oy); G.scale(sc,sc)
-    G.setColor(0.04,0.04,0.04,hanging and 0.34 or 1)
-    roundedRect("fill",bx,by,bw,bh,hanging and 3 or 0)
-    G.setColor(0.99,0.985,0.95,1)
-    roundedRect("fill",bx+2,by+2,bw-4,bh-4,hanging and 2 or 0)
-    if hanging then drawUnifiedBorder(bx,by,bw,bh,0) end
-    G.pop()
+    local bx,by,bw,bh=8,108,144,29
+    panel(bx,by,bw,bh)
     for i,line in ipairs(lines) do
       if i<=2 then
-        GoldCompat.panelText(tostring(line),bx+7,by+7+(i-1)*8,3.3,
-          {0.06,0.06,0.06,1},"left",bw-14)
+        GoldCompat.panelText(tostring(line),bx+8,by+7+(i-1)*8,3.15,
+          {0.88,0.96,0.93,1},"left",bw-16)
       end
     end
   end
 
-  if mart.phase=="buyQuantity" or mart.phase=="sellQuantity" then
-    G.push("all"); G.translate(ox,oy); G.scale(sc,sc)
-    drawShopPanel(91,73,59,25,true)
-    G.pop()
-    GoldCompat.panelText(("×%02d"):format(mart.qty or 1),97,80,4.3,
-      {0.06,0.06,0.06,1})
+  -- Quantity panels always sit over the surface that spawned them: BUY list
+  -- for purchases, custom Bag for sales.
+  if phase=="buyQuantity" or phase=="sellQuantity" then
+    local qx,qy,qw,qh=92,73,59,27
+    panel(qx,qy,qw,qh)
+    GoldCompat.panelText("HOW MANY?",qx+7,qy+5,2.35,{0.55,0.78,0.69,1})
+    GoldCompat.panelText(("×%02d"):format(mart.qty or 1),qx+7,qy+13,3.8,
+      {0.94,0.99,0.97,1})
+    if mart.qtyItem and mart.qtyItem.price then
+      local totalPrice
+      if phase=="sellQuantity" then
+        totalPrice=math.floor((mart.qtyItem.price or 0)*(mart.qty or 1)/2)
+      else
+        totalPrice=(mart.qtyItem.price or 0)*(mart.qty or 1)
+      end
+      GoldCompat.panelText(("¥%d"):format(totalPrice),qx+qw-30,qy+13,2.65,
+        {0.72,0.92,0.85,1},"right",23)
+    end
   end
+
   if mart.confirm and mart.confirm.page>=#(mart.confirm.pages or {}) then
-    GoldCompat.panelText(mart.confirm.choice==1 and "YES   no" or "yes   NO",
-      112,94,2.9,{0.08,0.08,0.08,1})
+    local cx,cy,cw,ch=109,84,42,24
+    panel(cx,cy,cw,ch)
+    local c=mart.confirm.choice or 1
+    selection(cx+5,cy+4+(c-1)*8,cw-10,8)
+    GoldCompat.panelText("YES",cx+11,cy+5,2.55,
+      c==1 and {1,1,1,1} or {0.73,0.86,0.81,1})
+    GoldCompat.panelText("NO",cx+11,cy+13,2.55,
+      c==2 and {1,1,1,1} or {0.73,0.86,0.81,1})
   end
 end
 
@@ -17433,6 +18007,10 @@ function GoldCompat.installGoldServiceUI()
     end
     if type(CenterPcMenu.__gen3uiOriginalUpdate)=="function" then
       CenterPcMenu.update=function(self,dt,...)
+        if goldScreenEnabled("revampedPokemonPC") then
+          self.isOpaque=false
+          self.__gen3uiGoldOverlayKind="centerpc"
+        end
         if goldScreenEnabled("revampedPokemonPC") and self.confirm then
           local input=self.game and self.game.input
           local previous=math.max(1,math.min(2,
@@ -17503,14 +18081,19 @@ function GoldCompat.installGoldServiceUI()
       PcMenu.new=function(...)
         local self=PcMenu.__gen3uiOriginalNew(...)
         if type(self)=="table" then
-          self.isOpaque=goldScreenEnabled("revampedPokemonPC")
-            and false or PcMenu.__gen3uiOriginalOpaque
+          local enabled=goldScreenEnabled("revampedPokemonPC")
+          self.isOpaque=enabled and false or PcMenu.__gen3uiOriginalOpaque
+          self.__gen3uiGoldOverlayKind=enabled and "pc-root" or nil
         end
         return self
       end
     end
     if type(PcMenu.__gen3uiOriginalUpdate)=="function" then
       PcMenu.update=function(self,dt,...)
+        if goldScreenEnabled("revampedPokemonPC") then
+          self.isOpaque=false
+          self.__gen3uiGoldOverlayKind="pc-root"
+        end
         if goldScreenEnabled("revampedPokemonPC") and not self.message then
           local count=self.picking and 14 or (self.entries or {})
           local key=self.picking and "pickIndex" or "index"
@@ -17564,14 +18147,19 @@ function GoldCompat.installGoldServiceUI()
       BoxMenu.new=function(...)
         local self=BoxMenu.__gen3uiOriginalNew(...)
         if type(self)=="table" then
-          self.isOpaque=goldScreenEnabled("revampedPokemonPC")
-            and false or BoxMenu.__gen3uiOriginalOpaque
+          local enabled=goldScreenEnabled("revampedPokemonPC")
+          self.isOpaque=enabled and false or BoxMenu.__gen3uiOriginalOpaque
+          self.__gen3uiGoldOverlayKind=enabled and "pc-box" or nil
         end
         return self
       end
     end
     if type(BoxMenu.__gen3uiOriginalUpdate)=="function" then
       BoxMenu.update=function(self,dt,...)
+        if goldScreenEnabled("revampedPokemonPC") then
+          self.isOpaque=false
+          self.__gen3uiGoldOverlayKind="pc-box"
+        end
         if goldScreenEnabled("revampedPokemonPC") and self.phase~="submenu" then
           local input=self.game and self.game.input
           local left=input and input:wasPressed("left")
@@ -17661,6 +18249,7 @@ function GoldCompat.installGoldServiceUI()
   if okItem and type(ItemPcMenu)=="table" and not ItemPcMenu.__gen3uiVisualPatched then
     ItemPcMenu.__gen3uiVisualPatched=true
     ItemPcMenu.__gen3uiOriginalOpaque=ItemPcMenu.isOpaque
+    ItemPcMenu.__gen3uiOriginalNew=ItemPcMenu.new
     ItemPcMenu.isOpaque=false
     ItemPcMenu.__gen3uiOriginalUpdate=ItemPcMenu.update
     ItemPcMenu.__gen3uiOriginalDraw=ItemPcMenu.draw
@@ -17675,8 +18264,23 @@ function GoldCompat.installGoldServiceUI()
       if GoldCompat.itemPcPresentationEnabled() then return false end
       return callOriginal(ItemPcMenu.__gen3uiOriginalWantsFillScale,self)
     end
+    if type(ItemPcMenu.__gen3uiOriginalNew)=="function" then
+      ItemPcMenu.new=function(...)
+        local self=ItemPcMenu.__gen3uiOriginalNew(...)
+        if type(self)=="table" then
+          local enabled=GoldCompat.itemPcPresentationEnabled()
+          self.isOpaque=enabled and false or ItemPcMenu.__gen3uiOriginalOpaque
+          self.__gen3uiGoldOverlayKind=enabled and "pc-item" or nil
+        end
+        return self
+      end
+    end
     if type(ItemPcMenu.__gen3uiOriginalUpdate)=="function" then
       ItemPcMenu.update=function(self,dt,...)
+        if GoldCompat.itemPcPresentationEnabled() then
+          self.isOpaque=false
+          self.__gen3uiGoldOverlayKind="pc-item"
+        end
         if GoldCompat.itemPcPresentationEnabled()
             and self.phase=="menu" and not self.message
             and not self.qtyState and not self.confirm then
@@ -19531,6 +20135,7 @@ function GoldCompat.installCoreMenuUI()
       end
     end
     PartyMenu.update=function(self,dt)
+      if featureEnabled("colosseumPokemonMenu") then self.isOpaque=false end
       if not featureEnabled("colosseumPokemonMenu") then
         return PartyMenu.__gen3uiOriginalUpdate(self,dt)
       end
@@ -19617,6 +20222,7 @@ function GoldCompat.installCoreMenuUI()
     end
 
     SummaryMenu.update=function(self,dt)
+      if GoldCompat.pokemonPresentationEnabled() then self.isOpaque=false end
       local input=self.game and self.game.input
       if GoldCompat.pokemonPresentationEnabled() and input
           and self.__colosseumMoveManager then
@@ -20394,34 +21000,6 @@ function GoldCompat.installGoldBattlePresentation()
     return result
   end
 
-  GoldBattleState.drawPanel=function(self,...)
-    -- Gold draws its own YES/NO box inside drawPanel. While our battle UI is
-    -- active, temporarily keep its message timer positive for this draw only,
-    -- which suppresses that native box without touching input or battle flow.
-    local suppressChoice=(GoldCompat.battlePresentationEnabledFor(self)
-        or featureEnabled("hideNativeBattleUI"))
-      and (self.phase=="ask-shift" or self.phase=="ask-nickname"
-        or self.phase=="ask-forget" or self.phase=="stop-learning")
-      and (self.messageTimer or 0)<=0
-    local timer=self.messageTimer
-    if suppressChoice then self.messageTimer=1 end
-    local result=original(self,...)
-    if suppressChoice then self.messageTimer=timer end
-    if GoldCompat.battlePresentationEnabledFor(self)
-        or featureEnabled("hideNativeBattleUI") then
-      -- Erase only Gold's native HUD/text/menu tile regions after it has drawn.
-      -- Pokémon/trainer pictures occupy the complementary parts of the 160x144
-      -- battle canvas and remain fully engine-owned.
-      local g=love.graphics
-      g.push("all")
-      g.setColor(1,1,1,1)
-      g.rectangle("fill",0,0,88,34)       -- enemy HUD
-      g.rectangle("fill",70,54,90,43)     -- player HUD
-      g.rectangle("fill",0,96,160,48)     -- text / command / move area
-      g.pop()
-    end
-    return result
-  end
 end
 
 local function battleOverlayHook(next,battle)
@@ -20545,6 +21123,56 @@ function GoldCompat.drawSafariZoneHud(game)
   finalText("STEPS "..tostring(math.max(0,tonumber(st.steps) or 0)),x+25,y+10,1.45,
     {0.76,0.87,0.82,1},ox,oy,sc,"right",w-30)
   return true
+end
+
+function GoldCompat.nativeOverlayRenderHidden(state)
+  if not state then return false end
+  local game=state.game or (modRef and modRef.game) or GoldCompat.game
+  if not game then return false end
+  local stack=game.stack and game.stack.states
+  local top=type(stack)=="table" and stack[#stack] or nil
+
+  -- Dialogue/YES-NO is rendered in render.hud, after every world/renderer pass.
+  -- Hiding the native state here removes both its pixels and its opacity/palette
+  -- ownership while preserving update/input on the real state stack.
+  -- Gen I needs the hard final-state kill switch because several renderer
+  -- stacks can redraw the native TextBox after our normal adapters. Gen II
+  -- already uses the shared TextBox/ChoiceBox adapter; hiding its top state
+  -- here prevents that adapter from publishing the active dialogue at all.
+  -- Let Gold's real dialogue state reach its themed draw wrapper, while still
+  -- suppressing mirrored native underlays below it.
+  if GoldCompat.generation=="gen1"
+      and featureEnabled("revampedDialogueBoxes") and state==top then
+    if GoldCompat.isDialogueTextState(state)
+        or GoldCompat.isDialogueChoiceState(state,
+          type(stack)=="table" and stack[#stack-1] or nil) then
+      return true
+    end
+  end
+
+  -- When a themed dialogue is sitting over one of our explicitly mirrored
+  -- hanging surfaces, omit the native underlay too. renderHudUnderlays redraws
+  -- the same authoritative state later, so a renderer mod cannot resurrect its
+  -- white/black backing behind our glass UI by changing isOpaque or draw order.
+  local dialogueTop=top and (GoldCompat.isDialogueTextState(top)
+    or GoldCompat.isDialogueChoiceState(top,
+      type(stack)=="table" and stack[#stack-1] or nil))
+  if dialogueTop then
+    if state==State.activeParty and GoldCompat.pokemonPresentationEnabled() then
+      return true
+    end
+    if (state.__gen3uiBag or state.__gen3uiBagAction)
+        and GoldCompat.bagPresentationEnabled() then
+      return true
+    end
+    if (state.__gen3uiPCAccess or state.__gen3uiPCMain or state.__gen3uiPCList
+        or state.__gen3uiPCAction or state.__gen3uiPCItemRoot
+        or state.__gen3uiPCItemList)
+        and featureEnabled("revampedPokemonPC") then
+      return true
+    end
+  end
+  return false
 end
 
 function GoldCompat.renderHudUnderlays(mod,game)
@@ -20979,6 +21607,32 @@ function GoldCompat.renderHudUnderlays(mod,game)
     State.activeBagActionMenu=nil
   end
 
+  -- Mart SELL keeps the exact custom Bag visible while quantity and YES/NO
+  -- states sit above it.  These top states are native transaction controls;
+  -- only their chrome is replaced, so selling behavior stays authoritative.
+  local sellTop=topState(game)
+  if sellTop and (sellTop.__gen3uiShopSellQuantity or sellTop.__gen3uiShopSellChoice)
+      and GoldCompat.bagPresentationEnabled() then
+    local sellBag=bagStateForMenu(game)
+    if sellBag and sellBag.__gen3uiShopSellBag then
+      pcall(drawBagFinal,game,sellBag)
+      if sellTop.__gen3uiShopSellQuantity then
+        local ox,oy,sc=finalCanvas()
+        local g=love.graphics
+        g.push("all"); g.translate(ox,oy); g.scale(sc,sc)
+        g.setColor(0.015,0.04,0.045,0.97); roundedRect("fill",87,77,66,26,4)
+        g.setColor(0.30,0.61,0.58,0.96); roundedRect("line",87,77,66,26,4)
+        g.pop()
+        finalText("HOW MANY?",92,81,3.0,{0.82,0.94,0.90,1},ox,oy,sc)
+        finalText(("×%02d"):format(sellTop.qty or 1),93,90,4.4,{1,1,1,1},ox,oy,sc)
+        if sellTop.unitPrice then
+          local total=(sellTop.qty or 1)*sellTop.unitPrice
+          finalText(("¥%d"):format(total),121,90,3.8,{0.72,0.92,0.85,1},ox,oy,sc)
+        end
+      end
+    end
+  end
+
   -- During TM/HM boot-up dialogue the actual Bag ListMenu is still in
   -- game.stack underneath the TextBox. Draw THAT live state directly.
   -- This is intentionally independent of whether ListMenu.draw ran this frame.
@@ -21014,7 +21668,13 @@ function GoldCompat.renderHudUnderlays(mod,game)
   -- PC-owned TextBox/ChoiceBox prompts sit above BoxMenu/ListMenu on the
   -- native stack. Re-render the nearest marked PC state here so confirmation
   -- and transfer messages retain our custom PC background, never native chrome.
-  if (State.activeDialogueBox or State.activeChoiceBox)
+  local underlayTop=topState(game)
+  local underlayStates=game and game.stack and game.stack.states
+  local underlayDialogue=underlayTop and (
+    GoldCompat.isDialogueTextState(underlayTop)
+    or GoldCompat.isDialogueChoiceState(underlayTop,
+      type(underlayStates)=="table" and underlayStates[#underlayStates-1] or nil))
+  if (State.activeDialogueBox or State.activeChoiceBox or underlayDialogue)
       and featureEnabled("revampedPokemonPC") then
     local pcUnder=pcStateInStack(game)
     if pcUnder then
@@ -21048,7 +21708,34 @@ function GoldCompat.renderHudUnderlays(mod,game)
 end
 
 function GoldCompat.renderHudDialogueLayer(mod,game)
-  -- Dialogue/choices were marked by their native draw calls earlier this frame.
+  -- API v2 may hide a state through screen.render_visible before its draw
+  -- method gets a chance to publish the old activeDialogueBox/activeChoiceBox
+  -- marker.  Recover the foreground owner from the authoritative stack every
+  -- frame.  This closes the one-frame Gen I gap where the palette-composited
+  -- base (red in Red's boot-ROM palette) could be presented by itself during
+  -- chained dialogue and TextBox -> ChoiceBox handoffs.
+  local stack=game and game.stack and game.stack.states
+  local top=type(stack)=="table" and stack[#stack] or nil
+  if State.activeDialogueBox
+      and not stateExistsInStack(game,State.activeDialogueBox) then
+    State.activeDialogueBox=nil
+  end
+  if State.activeChoiceBox
+      and not stateExistsInStack(game,State.activeChoiceBox) then
+    State.activeChoiceBox=nil
+  end
+  if featureEnabled("revampedDialogueBoxes") and top then
+    if GoldCompat.isDialogueTextState(top) then
+      State.activeDialogueBox=top
+    elseif GoldCompat.isDialogueChoiceState(top,stack[#stack-1]) then
+      State.activeChoiceBox=top
+      local owner=stack[#stack-1]
+      if GoldCompat.isDialogueTextState(owner) then
+        State.activeDialogueBox=owner
+      end
+    end
+  end
+
   -- Render ONLY the themed version now, outside the palette compositor.
   --
   -- Gen I caught-mon AskName is slightly different from ordinary script
@@ -21229,7 +21916,223 @@ function GoldCompat.renderCrossgenFlowOverlay(mod,game)
   return ownsForeground
 end
 
+function GoldCompat.drawStrictGenericMenu(menu)
+  if not menu then return end
+  local G=love.graphics
+  local ox,oy,sc=finalCanvas()
+  local items=menu.items or {}
+  local visible=(menu.maxVisible and math.min(menu.maxVisible,#items)) or #items
+  visible=math.max(1,math.min(8,visible))
+  local w=math.max(58,math.min(118,(tonumber(menu.tw) or 10)*8+8))
+  local h=20+visible*13
+  local x=math.max(4,154-w)
+  local y=math.max(5,math.min(132-h,(tonumber(menu.ty) or 0)*8+5))
+  G.push("all"); G.translate(ox,oy); G.scale(sc,sc)
+  drawColosseumRunoffPanel(x,y,w,h,13)
+  for row=1,visible do
+    local idx=(tonumber(menu.scroll) or 0)+row
+    local entry=items[idx]
+    if entry then
+      local yy=y+17+(row-1)*13
+      if idx==(tonumber(menu.index) or 1) then
+        drawColosseumRunoffSelection(x+4,yy-2,w-9,11)
+      end
+    end
+  end
+  G.pop()
+  finalText("MENU",x+8,y+5,3.0,{0.48,1.00,0.72,1},ox,oy,sc)
+  for row=1,visible do
+    local idx=(tonumber(menu.scroll) or 0)+row
+    local entry=items[idx]
+    if entry then
+      finalText(tostring(entry.label or entry.value or "—"),x+13,y+18+(row-1)*13,3.1,
+        idx==(tonumber(menu.index) or 1) and {1,1,1,1} or {0.76,0.88,0.84,1},
+        ox,oy,sc,"left",w-18)
+    end
+  end
+end
+
+function GoldCompat.drawStrictGenericList(list)
+  if not list then return end
+  local G=love.graphics
+  local ox,oy,sc=finalCanvas()
+  local items=list.items or {}
+  local rows=math.max(1,math.min(7,tonumber(list.rows) or 7))
+  local x,y,w,h=14,14,142,112
+  G.push("all"); G.translate(ox,oy); G.scale(sc,sc)
+  drawColosseumRunoffPanel(x,y,w,h,15)
+  for row=1,rows do
+    local idx=(tonumber(list.scroll) or 0)+row
+    local entry=items[idx]
+    if entry then
+      local yy=y+20+(row-1)*12
+      if idx==(tonumber(list.index) or 1) then
+        drawColosseumRunoffSelection(x+4,yy-2,w-8,10)
+      end
+    end
+  end
+  G.pop()
+  finalText(tostring(list.title or list.kind or "MENU"),x+8,y+5,3.2,{0.48,1.00,0.72,1},ox,oy,sc,"left",w-16)
+  for row=1,rows do
+    local idx=(tonumber(list.scroll) or 0)+row
+    local entry=items[idx]
+    if entry then
+      local yy=y+20+(row-1)*12
+      local selected=idx==(tonumber(list.index) or 1)
+      finalText(tostring(entry.label or entry.value or "—"),x+13,yy,2.9,selected and {1,1,1,1} or {0.76,0.88,0.84,1},ox,oy,sc,"left",88)
+      if entry.right~=nil then
+        finalText(tostring(entry.right),x+w-11,yy,2.7,selected and {1,0.78,0.42,1} or {0.56,0.74,0.68,1},ox,oy,sc,"right",36)
+      end
+    end
+  end
+  if list.footer then finalText(tostring(list.footer):gsub("\n","   "),x+8,y+h-10,2.0,{0.58,0.76,0.70,1},ox,oy,sc,"left",w-16) end
+end
+
+function GoldCompat.drawStrictTownMap(tm)
+  local G=love.graphics; local ox,oy,sc=finalCanvas()
+  G.push("all"); G.translate(ox,oy); G.scale(sc,sc)
+  drawColosseumRunoffPanel(5,7,150,126,15)
+  G.setColor(0.008,0.035,0.040,0.88); roundedRect("fill",12,29,136,78,3)
+  G.setColor(0.18,0.45,0.42,0.55); G.rectangle("line",13,30,134,76,3,3)
+  local locs=tm.locs or {}
+  local minx,maxx,miny,maxy=999,-999,999,-999
+  for _,loc in ipairs(locs) do if loc.x and loc.y then minx=math.min(minx,loc.x); maxx=math.max(maxx,loc.x); miny=math.min(miny,loc.y); maxy=math.max(maxy,loc.y) end end
+  for i,loc in ipairs(locs) do
+    if loc.x and loc.y and maxx>=minx and maxy>=miny then
+      local px=18+(loc.x-minx)/math.max(1,maxx-minx)*122
+      local py=35+(loc.y-miny)/math.max(1,maxy-miny)*64
+      local sel=i==(tonumber(tm.sel) or 1)
+      G.setColor(sel and {1.00,0.34,0.16,1} or {0.35,0.90,0.68,0.92})
+      G.circle("fill",px,py,sel and 2.7 or 1.7)
+    end
+  end
+  G.pop()
+  local sel=(tm.locs or {})[tonumber(tm.sel) or 1]
+  finalText(tm.fly and "FLY MAP" or (tm.nestSpecies and "AREA" or "TOWN MAP"),12,13,3.2,{0.48,1.00,0.72,1},ox,oy,sc)
+  finalText(sel and tostring(tm:bannerText(sel)) or "KANTO",15,112,3.4,{1,1,1,1},ox,oy,sc,"left",130)
+  finalText(tm.fly and "A: FLY   B: BACK" or "D-PAD: MOVE   B: BACK",15,123,2.2,{0.58,0.76,0.70,1},ox,oy,sc,"left",130)
+end
+
+function GoldCompat.drawStrictPicBox(pb)
+  local G=love.graphics; local ox,oy,sc=finalCanvas()
+  G.push("all"); G.translate(ox,oy); G.scale(sc,sc)
+  drawColosseumRunoffPanel(45,28,72,80,13)
+  G.setColor(0.006,0.026,0.030,0.90); roundedRect("fill",53,46,56,50,3)
+  if pb.image then
+    local w,h=pb.image:getDimensions(); local k=math.min(46/math.max(1,w),42/math.max(1,h),1.7)
+    G.setColor(1,1,1,1); G.draw(pb.image,81,71,0,k,k,w/2,h/2)
+  end
+  G.pop(); finalText("POKéMON",53,35,3.0,{0.48,1.00,0.72,1},ox,oy,sc)
+end
+
+function GoldCompat.drawStrictDiploma(d)
+  local ox,oy,sc=finalCanvas(); local G=love.graphics
+  G.push("all"); G.translate(ox,oy); G.scale(sc,sc)
+  drawColosseumRunoffPanel(10,12,145,119,16)
+  G.setColor(0.010,0.040,0.042,0.84); roundedRect("fill",18,36,129,76,3)
+  G.setColor(0.30,0.62,0.56,0.7); roundedRect("line",19,37,127,74,3)
+  G.pop()
+  finalText("DIPLOMA",18,19,3.8,{1.00,0.72,0.28,1},ox,oy,sc)
+  finalText("PLAYER  "..tostring(d.game and d.game.save and d.game.save.player and d.game.save.player.name or "TRAINER"),24,45,3.2,{1,1,1,1},ox,oy,sc,"left",116)
+  finalText("Congratulations!",24,61,3.0,{0.48,1.00,0.72,1},ox,oy,sc)
+  finalText("Your POKéDEX completion",24,74,2.65,{0.80,0.90,0.86,1},ox,oy,sc)
+  finalText("has been officially certified.",24,84,2.45,{0.80,0.90,0.86,1},ox,oy,sc)
+  finalText("GAME FREAK",92,101,2.8,{1.00,0.72,0.28,1},ox,oy,sc,"right",48)
+  finalText("A/B: CLOSE",20,119,2.2,{0.58,0.76,0.70,1},ox,oy,sc)
+end
+
+function GoldCompat.drawStrictHallOfFame(hof)
+  local ox,oy,sc=finalCanvas(); local G=love.graphics
+  G.push("all"); G.translate(ox,oy); G.scale(sc,sc)
+  drawColosseumRunoffPanel(5,7,150,126,15)
+  G.setColor(0.006,0.026,0.030,0.88); roundedRect("fill",12,30,136,78,3)
+  G.pop()
+  finalText("HALL OF FAME",12,13,3.5,{1.00,0.72,0.28,1},ox,oy,sc)
+  local mon=hof.game and hof.game.save and hof.game.save.party and hof.game.save.party[hof.index or 1]
+  if mon then
+    finalText(tostring(mon.nickname or mon.species or "POKéMON"),20,42,4.0,{1,1,1,1},ox,oy,sc,"left",110)
+    finalText("Lv."..tostring(mon.level or "?"),20,57,3.0,{0.48,1.00,0.72,1},ox,oy,sc)
+    finalText("No. "..tostring(hof.index or 1),20,70,2.7,{0.70,0.82,0.78,1},ox,oy,sc)
+  else
+    local player=hof.game and hof.game.save and hof.game.save.player or {}
+    finalText(tostring(player.name or "TRAINER"),20,48,4.2,{1,1,1,1},ox,oy,sc)
+    finalText("LEAGUE CHAMPION",20,65,3.0,{0.48,1.00,0.72,1},ox,oy,sc)
+  end
+  finalText("A: CONTINUE",18,118,2.2,{0.58,0.76,0.70,1},ox,oy,sc)
+end
+
+function GoldCompat.drawStrictBindings(bind)
+  GoldCompat.drawStrictGenericList(bind)
+  if not bind.capture then return end
+  local ox,oy,sc=finalCanvas(); local G=love.graphics
+  G.push("all"); G.translate(ox,oy); G.scale(sc,sc)
+  drawColosseumRunoffPanel(37,48,112,49,13); G.pop()
+  finalText("INPUT CAPTURE",45,55,3.0,{1.00,0.72,0.28,1},ox,oy,sc)
+  finalText("PRESS A BUTTON",45,70,3.3,{1,1,1,1},ox,oy,sc)
+  finalText("RELEASE TO SET",45,83,2.3,{0.58,0.76,0.70,1},ox,oy,sc)
+end
+
+function GoldCompat.drawStrictQuarantine(q)
+  local ox,oy,sc=finalCanvas(); local G=love.graphics
+  G.push("all"); G.translate(ox,oy); G.scale(sc,sc); drawColosseumRunoffPanel(7,8,148,126,15); G.pop()
+  finalText("LOAD REPORT",15,14,3.3,{1.00,0.72,0.28,1},ox,oy,sc)
+  for row=1,11 do
+    local line=q.lines and q.lines[(q.offset or 0)+row]
+    if line then finalText(tostring(line),15,34+(row-1)*7.2,2.25,{0.78,0.88,0.84,1},ox,oy,sc,"left",132) end
+  end
+  finalText("A: CONTINUE",15,121,2.2,{0.58,0.76,0.70,1},ox,oy,sc)
+end
+
 function GoldCompat.renderHudMenuLayer(mod,game)
+  -- Strict fallback ownership for otherwise-unclaimed gameplay states.
+  local strictTop=topState(game)
+  -- Gen I PP-item move selection is a native ListMenu logically, but visually
+  -- remains inside the custom Party deck. Drawing the kept Party object here
+  -- gives PP UP / ETHER the same uninterrupted Bag -> Party -> Move flow as
+  -- every other modernized item action.
+  if State.activePPMoveList then
+    local pp=State.activePPMoveList
+    if topState(game)==pp and GoldCompat.pokemonPresentationEnabled() then
+      local party=pp.__gen3uiPPParty or State.activeItemTargetParty
+      if party then
+        party.__gen3uiPPMoveParty=true
+        party.isOpaque=false
+        local okPP,errPP=pcall(GoldCompat.drawColosseumParty,game,party)
+        if not okPP and mod.log then
+          mod.log("error","Colosseum PP-item move picker failed: "..tostring(errPP))
+        end
+        return okPP
+      end
+    elseif not stateExistsInStack(game,pp) then
+      local party=pp.__gen3uiPPParty
+      if party then party.__gen3uiPPMoveParty=nil end
+      State.activePPMoveList=nil
+    end
+  end
+
+  local strictStates={
+    {"activeTownMap",GoldCompat.drawStrictTownMap},
+    {"activePicBox",GoldCompat.drawStrictPicBox},
+    {"activeDiploma",GoldCompat.drawStrictDiploma},
+    {"activeHallOfFame",GoldCompat.drawStrictHallOfFame},
+    {"activeBindings",GoldCompat.drawStrictBindings},
+    {"activeQuarantine",GoldCompat.drawStrictQuarantine},
+    {"activeGenericMenu",GoldCompat.drawStrictGenericMenu},
+    {"activeGenericList",GoldCompat.drawStrictGenericList},
+  }
+  for _,entry in ipairs(strictStates) do
+    local st=State[entry[1]]
+    if st then
+      if st==strictTop then
+        local okStrict,errStrict=pcall(entry[2],st)
+        if not okStrict and mod.log then mod.log("error","Colosseum strict UI fallback failed: "..tostring(errStrict)) end
+        return okStrict
+      elseif not stateExistsInStack(game,st) then
+        State[entry[1]]=nil
+      end
+    end
+  end
+
   -- Gen 1 level-up StatBox is a pushed battle UI state. Render its modern
   -- card here, after the battlefield, while leaving native A/B dismissal and
   -- queue sequencing completely untouched.
@@ -21371,7 +22274,61 @@ function GoldCompat.renderHudMenuLayer(mod,game)
   return false
 end
 
+function GoldCompat.drawOpeningTrainerPartyIndicator(battle)
+  if not (battle and battle.introBalls and type(battle.enemyParty)=="table"
+      and #battle.enemyParty>0 and GoldCompat.battlePresentationEnabledFor(battle)) then
+    return false
+  end
+  local ox,oy,sc=finalCanvas()
+  local wide=false
+  if battle.wideLayout then
+    local ok,value=pcall(battle.wideLayout,battle)
+    wide=ok and value or false
+  end
+  local x0=wide and 88 or 64
+  local y0=wide and 40 or 16
+  local gap=-8
+  local r=3.2
+  local g=love.graphics
+  g.push("all")
+  g.translate(ox,oy)
+  g.scale(sc,sc)
+  g.setColor(0.10,0.10,0.10,0.95)
+  g.rectangle("fill",wide and 41 or 17,wide and 46 or 22,54,2)
+  for i=1,6 do
+    local mon=battle.enemyParty[i]
+    local cx=x0+(i-1)*gap
+    if mon then
+      local alive=(mon.hp or 0)>0
+      g.setColor(alive and {0.92,0.18,0.14,1}
+                       or {0.42,0.42,0.40,0.85})
+      g.arc("fill","pie",cx,y0,r,math.pi,math.pi*2)
+      g.setColor(0.96,0.96,0.92,1)
+      g.arc("fill","pie",cx,y0,r,0,math.pi)
+      g.setColor(0.08,0.08,0.08,1)
+      g.setLineWidth(0.8)
+      g.circle("line",cx,y0,r)
+      g.line(cx-r,y0,cx+r,y0)
+      g.setColor(0.98,0.98,0.95,1)
+      g.circle("fill",cx,y0,0.9)
+      g.setColor(0.08,0.08,0.08,1)
+      g.circle("line",cx,y0,0.9)
+    else
+      g.setColor(0.32,0.32,0.30,0.55)
+      g.setLineWidth(0.8)
+      g.circle("line",cx,y0,r)
+    end
+  end
+  g.pop()
+  return true
+end
+
 function GoldCompat.renderHudBattleLayer(mod,game)
+  -- A renderer may hot-swap a battle method after battle.started. Reasserting
+  -- the tiny predicate/HUD guards here is effectively free when nothing moved
+  -- and guarantees our UI remains the final presentation layer.
+  if battleStateInStack(game) then GoldCompat.installBattleUiFirewall() end
+
   -- Battle-only pushed UI states own the foreground, but should still feel
   -- like part of the current battle rather than dropping back to classic boxes.
   local pushedBattle=battleStateInStack(game)
@@ -21426,6 +22383,11 @@ function GoldCompat.renderHudBattleLayer(mod,game)
   end
 
   local visualBattle=GoldCompat.presentBattleState(battle)
+
+  -- The opening trainer-party row used to require wrapping BattleState.draw.
+  -- Draw it here in the final UI layer instead so renderer/camera mods keep
+  -- unrestricted ownership of the battle draw pipeline.
+  pcall(GoldCompat.drawOpeningTrainerPartyIndicator,battle)
 
   -- Unified render path: Colosseum is a presentation sub-mode of Battle UI,
   -- not a second competing mod. The unified mod keeps all lifecycle,
@@ -21795,7 +22757,7 @@ function GoldCompat.endTitleMusicSession()
   end
 end
 
-local function wrapTitleLoadCallback(state,key)
+function GoldCompat.wrapTitleLoadCallback(state,key)
   if not (state and type(state[key])=="function") then return end
   local native=state[key]
   state[key]=function(...)
@@ -21822,8 +22784,8 @@ function GoldCompat.patchTitleClass(TitleClass,generation)
       -- so this is the exact boundary where the persistent menu music may end.
       -- Gen II's title onContinue only opens MainMenu and must NOT stop it.
       if generation=="gen1" then
-        wrapTitleLoadCallback(state,"onNewGame")
-        wrapTitleLoadCallback(state,"onContinue")
+        GoldCompat.wrapTitleLoadCallback(state,"onNewGame")
+        GoldCompat.wrapTitleLoadCallback(state,"onContinue")
       end
       return state
     end
@@ -21884,8 +22846,8 @@ function GoldCompat.patchGen2MainMenu(MainMenu)
     -- Gold's TitleState -> MainMenu transition is still part of the title/menu
     -- experience. Only these two callbacks actually leave the menu flow and
     -- load a save or begin a new game.
-    wrapTitleLoadCallback(state,"onNewGame")
-    wrapTitleLoadCallback(state,"onContinue")
+    GoldCompat.wrapTitleLoadCallback(state,"onNewGame")
+    GoldCompat.wrapTitleLoadCallback(state,"onContinue")
     return state
   end
 end
@@ -22053,6 +23015,16 @@ return function(mod)
   -- Battle Arts 1.8+ exposes an official presentation contract. This standalone
   -- mod cannot rely on the old Gen 3 overhaul ID, so native suppression remains
   -- installed while Battle Arts retains ownership of its sprite presentation.
+  -- Read-only compatibility contract for presentation mods that want to
+  -- cooperate without knowing our implementation details.
+  mod.exports=mod.exports or {}
+  mod.exports.uiOwnership={
+    apiVersion=1,
+    ownsBattleUi=function(state) return GoldCompat.ownsNativeBattleLayer(state) end,
+    nativeBattleUiVisible=function(state) return not GoldCompat.ownsNativeBattleLayer(state) end,
+    presentation="final-ui-layer",
+  }
+
   local baHandle = mod.find and mod.find("BATTLE_ART_VOXEL_FORK") or nil
   local baPresentation = baHandle and baHandle.exports
       and baHandle.exports.battlePresentation or nil
@@ -22073,93 +23045,53 @@ return function(mod)
     end,1000)
   end
 
-  -- Install native lifecycle-preserving suppression on classic/non-BA paths.
-  -- The hard HIDE NATIVE BATTLE UI option also needs this wrapper available
-  -- even when another presentation mod owns normal suppression.
+  -- Launcher API v2 is the primary native-HUD ownership seam. The method
+  -- firewall below is only a compatibility fallback for renderers that cache
+  -- or replace battle methods after the normal mod-load phase.
+  if mod.hooks and type(mod.hooks.wrap)=="function" then
+    mod.hooks:wrap("battle.bottom_ui_visible",function(next,state)
+      if GoldCompat.ownsNativeBattleLayer(state) then return false end
+      return next(state)
+    end,12000)
+    mod.hooks:wrap("battle.status_hud_visible",function(next,state)
+      if GoldCompat.ownsNativeBattleLayer(state) then return false end
+      return next(state)
+    end,12000)
+
+    -- Final state-stack ownership seam for hanging overlays. This executes
+    -- outside renderer-specific draw functions, so changing isOpaque or
+    -- reordering another mod's compositor cannot expose the native box beneath.
+    mod.hooks:wrap("screen.render_visible",function(next,state)
+      local visible=next(state)
+      if visible==false then return false end
+      if GoldCompat.nativeOverlayRenderHidden(state) then return false end
+      return visible
+    end,20000)
+  end
+
   State.Installers.patchVanillaTextDrawing()
+
+  if mod.events and type(mod.events.on)=="function" then
+    -- mods.loaded is the true "everyone has installed their wrappers" seam.
+    -- Run at the end of that event, then again at the end of battle.started
+    -- because StadiumBattleFX deliberately reattaches its presentation host
+    -- at the battle boundary.
+    mod.events:on("mods.loaded",function()
+      GoldCompat.installBattleUiFirewall()
+    end,-20000)
+    mod.events:on("battle.started",function(payload)
+      local battle=payload and (payload.battle or payload.state)
+      if battle then State.activeBattle=battle end
+      GoldCompat.installBattleUiFirewall()
+    end,-20000)
+  end
   if baNativeContract and mod.log then
     mod.log:info("Colosseum UI: using Battle Arts 1.8 native presentation contract")
   end
 
-  -- Dramaless Shape captures the native HUD into its 3D battle canvas before
-  -- render.hud. Disable only that legacy HUD-snap compositor while our battle
-  -- UI owns presentation (or when the hard hide switch is enabled). Dramaless
-  -- keeps full ownership of arena, camera, sprites, lighting and world render.
-  local dramaHandle=GoldCompat.generation=="gen1"
-      and mod.find and mod.find("DRAMALESS_SHAPE") or nil
-  local dramaV=dramaHandle and dramaHandle.exports and dramaHandle.exports.lib
-  if dramaV and type(dramaV.require)=="function" then
-    local okDrama,OverworldBattle=pcall(dramaV.require,"OverworldBattle")
-    if okDrama and OverworldBattle and type(OverworldBattle.snapHUDs)=="function"
-        and not OverworldBattle.__gen3uiSnapPatched then
-      OverworldBattle.__gen3uiSnapPatched=true
-      local originalSnapHUDs=OverworldBattle.snapHUDs
-      OverworldBattle.snapHUDs=function(battle,shot)
-        if GoldCompat.battlePresentationEnabledFor(battle)
-            or featureEnabled("hideNativeBattleUI") then
-          return false
-        end
-        return originalSnapHUDs(battle,shot)
-      end
-
-      -- Dramaless has a second, independent glass-panel pass used when its HUD
-      -- is not snapped. If the HUD capture is suppressed but this survives,
-      -- it leaves the large empty gray rectangle seen behind our command UI.
-      if type(OverworldBattle.drawHudPanels)=="function" then
-        local originalDrawHudPanels=OverworldBattle.drawHudPanels
-        OverworldBattle.drawHudPanels=function(battle,...)
-          if GoldCompat.battlePresentationEnabledFor(battle)
-              or featureEnabled("hideNativeBattleUI") then
-            return
-          end
-          return originalDrawHudPanels(battle,...)
-        end
-      end
-
-      if mod.log then
-        mod.log:info("Colosseum UI: Dramaless Shape battle-HUD compatibility active")
-      end
-    end
-  end
-
-  -- Dramatic Shape 1.8.x compatibility is intentionally isolated.
-  -- If DRAMATIC_SHAPE is not active, this block does absolutely nothing.
-  local dramaticHandle=GoldCompat.generation=="gen1"
-      and mod.find and mod.find("DRAMATIC_SHAPE") or nil
-  local dramaticV=dramaticHandle and dramaticHandle.exports
-      and dramaticHandle.exports.lib or nil
-  if dramaticV and type(dramaticV.require)=="function" then
-    local okDramatic,OverworldBattle=pcall(dramaticV.require,"OverworldBattle")
-    if okDramatic and OverworldBattle
-        and type(OverworldBattle.snapHUDs)=="function"
-        and not OverworldBattle.__gen3uiDramaticPatched then
-      OverworldBattle.__gen3uiDramaticPatched=true
-
-      local originalDramaticSnap=OverworldBattle.snapHUDs
-      OverworldBattle.snapHUDs=function(battle,shot)
-        if GoldCompat.battlePresentationEnabledFor(battle)
-            or featureEnabled("hideNativeBattleUI") then
-          return false
-        end
-        return originalDramaticSnap(battle,shot)
-      end
-
-      if type(OverworldBattle.drawHudPanels)=="function" then
-        local originalDramaticPanels=OverworldBattle.drawHudPanels
-        OverworldBattle.drawHudPanels=function(battle,...)
-          if GoldCompat.battlePresentationEnabledFor(battle)
-              or featureEnabled("hideNativeBattleUI") then
-            return
-          end
-          return originalDramaticPanels(battle,...)
-        end
-      end
-
-      if mod.log then
-        mod.log:info("Colosseum UI: Dramatic Shape 1.8 battle-HUD compatibility active")
-      end
-    end
-  end
+  -- Reassert the UI-only compatibility firewall after every renderer that
+  -- loaded before us has installed its battle presentation wrappers.
+  GoldCompat.installBattleUiFirewall()
 
   if GoldCompat.generation=="gen1" then
     State.Installers.installOverworldUI(mod)
@@ -22240,6 +23172,18 @@ return function(mod)
     end
     return out
   end, 500)
+
+  -- Gen I API-v2 dialogue palette guard. Preserve every other mod's zone
+  -- edits first, then deterministically resolve the underlying state's zones
+  -- under the save's COLORS mode while our themed dialogue owns the top.
+  mod.hooks:wrap("render.zones", function(next,game,zones)
+    local out=next(game,zones)
+    if out==nil then out=zones end
+    return GoldCompat.repairGen1TransientZones(game,out)
+  end, 12000)
+  if mod.log then
+    mod.log:info("Colosseum UI 1.1.0: Gen I UI/world palette safety locks active")
+  end
 
   mod.hooks:wrap("battle.overlay", battleOverlayHook, 9000)
   mod.hooks:wrap("render.hud", function(next,game,viewport)

@@ -1,7 +1,7 @@
 {
   "id": "colosseum_ui_overhaul",
   "name": "Colosseum Inspired UI Overhaul",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Community",
   "description": "Colosseum-inspired UI overhaul for Gen1Recomp with unified Gen I and Gen II presentation, battle HUDs, menus, PC, Pokédex, naming, evolution, area banners, and compatibility-focused presentation hooks while preserving native gameplay behavior.",
   "profile": "overhaul",
@@ -12,7 +12,10 @@
   "optional_dependencies": [
     "BATTLE_ART_VOXEL_FORK",
     "DRAMALESS_SHAPE",
-    "DRAMATIC_SHAPE"
+    "DRAMATIC_SHAPE",
+    "STADIUM_BATTLE_FX",
+    "BATTLE_CINEMATICS",
+    "potato_voxel"
   ],
   "conflicts": [
     "gen3_battle_ui"
@@ -27,5 +30,6 @@
   "games": [
     "gen1",
     "gen2"
-  ]
+  ],
+  "github": "HighDrexler/Colosseum-Inspired-UI-Overhaul-V.1.0.0"
 }
