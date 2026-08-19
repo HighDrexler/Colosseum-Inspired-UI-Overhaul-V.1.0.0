@@ -1,10 +1,10 @@
-# One-time verified repository import trigger for v2.0.2.
-name: Import verified 2.0.2 payload
+name: Verify and stage 2.0.2 repository payload
 
 on:
-  push:
+  pull_request:
     branches: [main]
     paths:
+      - '.repository-refresh-trigger'
       - '.github/workflows/publish-release.yml'
   workflow_dispatch:
 
@@ -12,46 +12,35 @@ permissions:
   contents: write
 
 jobs:
-  import-release:
+  stage-release-payload:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out PR head
+        uses: actions/checkout@v4
         with:
+          ref: ${{ github.head_ref }}
           fetch-depth: 0
 
-      - name: Locate exact tested 2.0.2 release asset
+      - name: Download and verify exact tested release asset
         env:
           GH_TOKEN: ${{ github.token }}
           EXPECTED_SHA256: 9ab6b3fe03306dd70ad0b6673f7b7850fe3f0d732496fbab23c459a6c458347e
+          ASSET: Colosseum-Inspired-UI-Overhaul-2.0.2.zip
+          TAG: v2.0.0
         shell: bash
         run: |
           set -euo pipefail
-          TAG=v2.0.0
-          echo "Release assets on $TAG:"
-          gh release view "$TAG" --json assets --jq '.assets[].name' || true
-          ASSET="$(gh release view "$TAG" --json assets --jq '.assets[].name' | grep -E '^Colosseum-Inspired-UI-Overhaul-2\.0\.2\.zip$' | head -n1 || true)"
-          if [ -z "$ASSET" ]; then
-            echo "ERROR: $TAG does not contain the exact Colosseum-Inspired-UI-Overhaul-2.0.2.zip asset."
-            echo "Repository payload was NOT modified."
-            exit 20
-          fi
           mkdir -p /tmp/colosseum-release
           gh release download "$TAG" --pattern "$ASSET" --dir /tmp/colosseum-release
           ACTUAL_SHA256="$(sha256sum "/tmp/colosseum-release/$ASSET" | awk '{print $1}')"
-          echo "Expected SHA-256: $EXPECTED_SHA256"
-          echo "Actual SHA-256:   $ACTUAL_SHA256"
+          echo "Expected: $EXPECTED_SHA256"
+          echo "Actual:   $ACTUAL_SHA256"
           test "$ACTUAL_SHA256" = "$EXPECTED_SHA256"
-          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
-
-      - name: Validate launcher-ready payload before replacement
-        shell: bash
-        run: |
-          set -euo pipefail
-          ZIP="/tmp/colosseum-release/$ASSET"
-          unzip -t "$ZIP"
+          unzip -t "/tmp/colosseum-release/$ASSET"
           rm -rf /tmp/colosseum-payload
           mkdir -p /tmp/colosseum-payload
-          unzip -q "$ZIP" -d /tmp/colosseum-payload
+          unzip -q "/tmp/colosseum-release/$ASSET" -d /tmp/colosseum-payload
           test -s /tmp/colosseum-payload/main.lua
           test -s /tmp/colosseum-payload/manifest.json
           jq -e '.id == "colosseum_ui_overhaul" and .entry == "main.lua" and .version == "2.0.2" and (.games | index("gen1")) and (.games | index("gen2"))' /tmp/colosseum-payload/manifest.json
@@ -60,9 +49,8 @@ jobs:
           test "$(find /tmp/colosseum-payload/assets/portrait_corrections -type f -name '*.png' | wc -l)" -eq 4
           test ! -e /tmp/colosseum-payload/assets/portrait_map.json
           test "$(find /tmp/colosseum-payload -type f -name '*.b64' | wc -l)" -eq 0
-          echo "Validated exact 2.0.2 launcher payload."
 
-      - name: Replace mod payload and preserve repository infrastructure
+      - name: Replace PR branch payload at repository root
         shell: bash
         run: |
           set -euo pipefail
@@ -74,27 +62,21 @@ jobs:
             ! -name 'SECURITY.md' \
             -exec rm -rf {} +
           cp -a /tmp/colosseum-payload/. .
-
-          test -s main.lua
-          test -s manifest.json
-          jq -e '.entry == "main.lua" and .version == "2.0.2"' manifest.json
-
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A
-          if git diff --cached --quiet; then
-            echo 'No repository payload changes were necessary.'
-            exit 0
-          fi
-          git commit -m 'Replace repository payload with verified v2.0.2'
-          git push origin HEAD:main
-
-      - name: Verify repository-root install contract
-        shell: bash
-        run: |
-          set -euo pipefail
+          rm -f .repository-refresh-trigger
           test -s main.lua
           test -s manifest.json
           test -d assets
           test "$(jq -r '.version' manifest.json)" = '2.0.2'
-          echo 'Repository root is launcher-ready: main.lua + manifest.json + assets are direct root entries.'
+
+      - name: Commit exact payload to PR head
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --quiet && { echo 'No payload changes required.'; exit 0; }
+          git commit -m 'Replace repository payload with verified v2.0.2'
+          git push origin "HEAD:$HEAD_REF"
