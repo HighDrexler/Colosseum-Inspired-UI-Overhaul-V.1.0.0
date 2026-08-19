@@ -1,28 +1,35 @@
-name: Verify and stage 2.0.2 repository payload
+name: Import verified 2.0.2 repository payload
 
 on:
-  pull_request:
+  push:
     branches: [main]
     paths:
       - '.repository-refresh-trigger'
-      - '.github/workflows/publish-release.yml'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  stage-release-payload:
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+  import-release-payload:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out PR head
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref }}
           fetch-depth: 0
 
+      - name: Skip if trigger is already gone
+        id: guard
+        shell: bash
+        run: |
+          if [ -f .repository-refresh-trigger ]; then
+            echo 'run=yes' >> "$GITHUB_OUTPUT"
+          else
+            echo 'run=no' >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download and verify exact tested release asset
+        if: steps.guard.outputs.run == 'yes'
         env:
           GH_TOKEN: ${{ github.token }}
           EXPECTED_SHA256: 9ab6b3fe03306dd70ad0b6673f7b7850fe3f0d732496fbab23c459a6c458347e
@@ -34,8 +41,8 @@ jobs:
           mkdir -p /tmp/colosseum-release
           gh release download "$TAG" --pattern "$ASSET" --dir /tmp/colosseum-release
           ACTUAL_SHA256="$(sha256sum "/tmp/colosseum-release/$ASSET" | awk '{print $1}')"
-          echo "Expected: $EXPECTED_SHA256"
-          echo "Actual:   $ACTUAL_SHA256"
+          echo "Expected SHA-256: $EXPECTED_SHA256"
+          echo "Actual SHA-256:   $ACTUAL_SHA256"
           test "$ACTUAL_SHA256" = "$EXPECTED_SHA256"
           unzip -t "/tmp/colosseum-release/$ASSET"
           rm -rf /tmp/colosseum-payload
@@ -50,7 +57,8 @@ jobs:
           test ! -e /tmp/colosseum-payload/assets/portrait_map.json
           test "$(find /tmp/colosseum-payload -type f -name '*.b64' | wc -l)" -eq 0
 
-      - name: Replace PR branch payload at repository root
+      - name: Replace repository payload at root
+        if: steps.guard.outputs.run == 'yes'
         shell: bash
         run: |
           set -euo pipefail
@@ -68,9 +76,8 @@ jobs:
           test -d assets
           test "$(jq -r '.version' manifest.json)" = '2.0.2'
 
-      - name: Commit exact payload to PR head
-        env:
-          HEAD_REF: ${{ github.head_ref }}
+      - name: Commit verified payload to main
+        if: steps.guard.outputs.run == 'yes'
         shell: bash
         run: |
           set -euo pipefail
@@ -79,4 +86,15 @@ jobs:
           git add -A
           git diff --cached --quiet && { echo 'No payload changes required.'; exit 0; }
           git commit -m 'Replace repository payload with verified v2.0.2'
-          git push origin "HEAD:$HEAD_REF"
+          git push origin HEAD:main
+
+      - name: Verify launcher-ready repository root
+        if: steps.guard.outputs.run == 'yes'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s main.lua
+          test -s manifest.json
+          test -d assets
+          test "$(jq -r '.version' manifest.json)" = '2.0.2'
+          echo 'Verified: main.lua, manifest.json, and assets are direct repository-root entries.'
