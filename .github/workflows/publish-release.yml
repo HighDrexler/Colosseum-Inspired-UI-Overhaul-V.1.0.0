@@ -1,3 +1,4 @@
+# One-time verified repository import trigger for v2.0.2.
 name: Import verified 2.0.2 payload
 
 on:
