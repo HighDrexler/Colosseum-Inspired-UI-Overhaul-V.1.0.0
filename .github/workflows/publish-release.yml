@@ -1,13 +1,9 @@
-name: Publish release asset
+name: Import verified 2.0.2 payload
 
 on:
   push:
     branches: [main]
     paths:
-      - 'manifest.json'
-      - 'main.lua'
-      - 'assets/**'
-      - 'CHANGELOG.md'
       - '.github/workflows/publish-release.yml'
   workflow_dispatch:
 
@@ -15,60 +11,89 @@ permissions:
   contents: write
 
 jobs:
-  publish:
+  import-release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Read release metadata
-        id: meta
-        shell: bash
-        run: |
-          VERSION="$(jq -r '.version' manifest.json)"
-          test "$VERSION" = '1.1.0'
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
-          echo "asset=Colosseum-Inspired-UI-Overhaul-$VERSION.zip" >> "$GITHUB_OUTPUT"
-
-      - name: Validate repository as a Gen1Recomp mod
-        shell: bash
-        run: |
-          test -s manifest.json
-          test -s main.lua
-          test -s assets/audio/colosseum_title.ogg
-          test -s assets/portrait_map.json
-          test "$(find assets/portraits -type f -name '*.png' | wc -l)" -eq 530
-          jq -e '.entry == "main.lua" and .version == "1.1.0"' manifest.json
-          echo 'ddb67cafbe03be542cdd3228a1cac05d0eadc73978b0993cee2bf49614f59e4f  main.lua' | sha256sum -c -
-
-      - name: Build installable release ZIP from repository source
-        shell: bash
-        run: |
-          ASSET='${{ steps.meta.outputs.asset }}'
-          zip -9 -q -r "$ASSET" \
-            manifest.json main.lua assets README.md CHANGELOG.md ARCHITECTURE.md GOLD_COMPATIBILITY.md NATIVE_SCREEN_SPEC.md
-          unzip -t "$ASSET"
-          unzip -l "$ASSET" | grep -q ' main.lua$'
-          unzip -l "$ASSET" | grep -q ' manifest.json$'
-          unzip -l "$ASSET" | grep -q ' assets/audio/colosseum_title.ogg$'
-          test "$(unzip -l "$ASSET" | awk '/assets\/portraits\/.*\.png$/ {n++} END {print n+0}')" -eq 530
-          sha256sum "$ASSET" > "$ASSET.sha256"
-
-      - name: Publish GitHub Release
+      - name: Locate exact tested 2.0.2 release asset
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.meta.outputs.tag }}
-          VERSION: ${{ steps.meta.outputs.version }}
-          ASSET: ${{ steps.meta.outputs.asset }}
+          EXPECTED_SHA256: 9ab6b3fe03306dd70ad0b6673f7b7850fe3f0d732496fbab23c459a6c458347e
         shell: bash
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber
-            gh release edit "$TAG" --title "Colosseum Inspired UI Overhaul v$VERSION" --notes-file CHANGELOG.md --latest
-          else
-            gh release create "$TAG" "$ASSET" "$ASSET.sha256" \
-              --target "$GITHUB_SHA" \
-              --title "Colosseum Inspired UI Overhaul v$VERSION" \
-              --notes-file CHANGELOG.md \
-              --latest
+          set -euo pipefail
+          TAG=v2.0.0
+          echo "Release assets on $TAG:"
+          gh release view "$TAG" --json assets --jq '.assets[].name' || true
+          ASSET="$(gh release view "$TAG" --json assets --jq '.assets[].name' | grep -E '^Colosseum-Inspired-UI-Overhaul-2\.0\.2\.zip$' | head -n1 || true)"
+          if [ -z "$ASSET" ]; then
+            echo "ERROR: $TAG does not contain the exact Colosseum-Inspired-UI-Overhaul-2.0.2.zip asset."
+            echo "Repository payload was NOT modified."
+            exit 20
           fi
+          mkdir -p /tmp/colosseum-release
+          gh release download "$TAG" --pattern "$ASSET" --dir /tmp/colosseum-release
+          ACTUAL_SHA256="$(sha256sum "/tmp/colosseum-release/$ASSET" | awk '{print $1}')"
+          echo "Expected SHA-256: $EXPECTED_SHA256"
+          echo "Actual SHA-256:   $ACTUAL_SHA256"
+          test "$ACTUAL_SHA256" = "$EXPECTED_SHA256"
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+
+      - name: Validate launcher-ready payload before replacement
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="/tmp/colosseum-release/$ASSET"
+          unzip -t "$ZIP"
+          rm -rf /tmp/colosseum-payload
+          mkdir -p /tmp/colosseum-payload
+          unzip -q "$ZIP" -d /tmp/colosseum-payload
+          test -s /tmp/colosseum-payload/main.lua
+          test -s /tmp/colosseum-payload/manifest.json
+          jq -e '.id == "colosseum_ui_overhaul" and .entry == "main.lua" and .version == "2.0.2" and (.games | index("gen1")) and (.games | index("gen2"))' /tmp/colosseum-payload/manifest.json
+          test -s /tmp/colosseum-payload/assets/audio/colosseum_title.ogg
+          test "$(find /tmp/colosseum-payload/assets/portraits -type f -name '*.png' | wc -l)" -eq 530
+          test "$(find /tmp/colosseum-payload/assets/portrait_corrections -type f -name '*.png' | wc -l)" -eq 4
+          test ! -e /tmp/colosseum-payload/assets/portrait_map.json
+          test "$(find /tmp/colosseum-payload -type f -name '*.b64' | wc -l)" -eq 0
+          echo "Validated exact 2.0.2 launcher payload."
+
+      - name: Replace mod payload and preserve repository infrastructure
+        shell: bash
+        run: |
+          set -euo pipefail
+          find . -mindepth 1 -maxdepth 1 \
+            ! -name '.git' \
+            ! -name '.github' \
+            ! -name '.gitignore' \
+            ! -name 'CONTRIBUTING.md' \
+            ! -name 'SECURITY.md' \
+            -exec rm -rf {} +
+          cp -a /tmp/colosseum-payload/. .
+
+          test -s main.lua
+          test -s manifest.json
+          jq -e '.entry == "main.lua" and .version == "2.0.2"' manifest.json
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'No repository payload changes were necessary.'
+            exit 0
+          fi
+          git commit -m 'Replace repository payload with verified v2.0.2'
+          git push origin HEAD:main
+
+      - name: Verify repository-root install contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s main.lua
+          test -s manifest.json
+          test -d assets
+          test "$(jq -r '.version' manifest.json)" = '2.0.2'
+          echo 'Repository root is launcher-ready: main.lua + manifest.json + assets are direct root entries.'
