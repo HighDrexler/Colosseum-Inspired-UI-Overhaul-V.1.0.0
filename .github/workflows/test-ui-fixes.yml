@@ -1,0 +1,166 @@
+name: Build isolated UI fixes test package
+
+on:
+  push:
+    branches: ['test/ui-fixes-stadium-display-20260821']
+    paths: ['.github/workflows/test-ui-fixes.yml', '.test-ui-fixes-trigger']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download exact verified 2.0.2 baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA256: 9ab6b3fe03306dd70ad0b6673f7b7850fe3f0d732496fbab23c459a6c458347e
+          ASSET: Colosseum-Inspired-UI-Overhaul-2.0.2.zip
+          TAG: v2.0.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ui-test
+          gh release download "$TAG" --pattern "$ASSET" --dir /tmp/ui-test
+          ACTUAL="$(sha256sum "/tmp/ui-test/$ASSET" | awk '{print $1}')"
+          echo "baseline expected=$EXPECTED_SHA256"
+          echo "baseline actual=$ACTUAL"
+          test "$ACTUAL" = "$EXPECTED_SHA256"
+          unzip -q "/tmp/ui-test/$ASSET" -d /tmp/ui-test/base
+          test -s /tmp/ui-test/base/main.lua
+          test -s /tmp/ui-test/base/manifest.json
+          test "$(jq -r '.version' /tmp/ui-test/base/manifest.json)" = '2.0.2'
+
+      - name: Apply presentation-only test fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/ui-test/patch.py <<'PY'
+          from pathlib import Path
+          import json, re
+
+          root=Path('/tmp/ui-test/base')
+          p=root/'main.lua'
+          s=p.read_text(encoding='utf-8')
+          original=s
+
+          def replace_once(old,new,label):
+              global s
+              n=s.count(old)
+              if n != 1:
+                  raise SystemExit(f'{label}: expected 1 anchor, got {n}')
+              s=s.replace(old,new,1)
+
+          # 1) Startup naming: SafeIntroNaming itself owns its visible draw.
+          # This removes dependence on a later HUD-overlay interception that can
+          # be skipped while the state remains fully interactive.
+          replace_once(
+              'function SafeIntroNaming:draw() end\nfunction SafeIntroNaming:drawWidescreen() end',
+              '''function SafeIntroNaming:draw()\n  local ok,err=pcall(GoldCompat.drawNamingFlow,self,self.__colosseumFlowKind or "naming")\n  if not ok then\n    self.__colosseumRenderFailed=true\n    if modRef and modRef.log then\n      pcall(function() modRef.log:error("Colosseum intro naming draw failed: "..tostring(err)) end)\n    end\n    return false\n  end\n  self.__colosseumRenderFailed=nil\n  return true\nend\nfunction SafeIntroNaming:drawWidescreen() end''',
+              'SafeIntroNaming direct draw')
+
+          # Prevent the same safe intro surface from being painted a second time
+          # by the generic post-stack flow overlay.
+          replace_once(
+              '  local kind=flow.__colosseumFlowKind\n  if not GoldCompat.flowPresentationEnabled(kind) then return false end',
+              '  local kind=flow.__colosseumFlowKind\n  if flow.__colosseumIntroSafe then return false end\n  if not GoldCompat.flowPresentationEnabled(kind) then return false end',
+              'SafeIntroNaming overlay ownership')
+
+          # 2) Unified shiny predicate.  Boolean providers still work, while
+          # Gen II/Battle-Arts-style DV shininess no longer disappears in UI art.
+          shiny_helper='''\nfunction GoldCompat.pokemonIsShiny(mon)\n  if type(mon)~="table" then return false end\n  if mon.shiny==true or mon.isShiny==true then return true end\n  if type(GoldCompat.isShiny)=="function" then\n    local ok,value=pcall(GoldCompat.isShiny,mon)\n    if ok and value then return true end\n  end\n  return false\nend\n\n'''
+          anchor='function GoldCompat.drawCleanResolvedPortrait(game,mon,x,y,w,h,kind)\n'
+          if s.count(anchor)!=1: raise SystemExit('drawCleanResolvedPortrait anchor missing')
+          s=s.replace(anchor,shiny_helper+anchor,1)
+
+          # Colosseum portrait selection must use the same shiny predicate.
+          s=s.replace('local shiny=mon and (mon.shiny or mon.isShiny)',
+                      'local shiny=mon and GoldCompat.pokemonIsShiny(mon)',1)
+
+          # 3) Raticate safety: the packaged #020 source is known-bad.  Never
+          # substitute another species; deliberately fail open to resolved art.
+          replace_once(
+              '  if not dex or dex<1 or dex>251 then return nil end\n\n  -- Every species',
+              '  if not dex or dex<1 or dex>251 then return nil end\n  if dex==20 then return nil end -- bad packaged Raticate portrait; use species-correct fallback\n\n  -- Every species',
+              'Raticate portrait fallback')
+
+          # 4) Optional Stadium 3D portrait renderer for Summary + Pokédex only.
+          # Uses StadiumBattleFX public Model API v1 and fails open to the exact
+          # pre-existing sprite resolver for every unavailable/error case.
+          stadium_code=r'''\nlocal function stadiumUiOptionEnabled()\n  local enabled=false\n  pcall(function()\n    enabled=modRef and modRef.options and modRef.options.get\n      and modRef.options:get("stadiumUiModels")==true or false\n  end)\n  return enabled\nend\n\nlocal function uiMatMul(a,b)\n  local o={}\n  for r=0,3 do\n    for c=1,4 do\n      o[r*4+c]=a[r*4+1]*b[c]+a[r*4+2]*b[4+c]+a[r*4+3]*b[8+c]+a[r*4+4]*b[12+c]\n    end\n  end\n  return o\nend\n\nlocal function uiPerspective(fov,aspect,n,f)\n  local q=1/math.tan(fov/2); local d=n-f\n  return {q/aspect,0,0,0, 0,q,0,0, 0,0,(f+n)/d,(2*f*n)/d, 0,0,-1,0}\nend\n\nlocal function uiLookAt(eye,target,up)\n  local function sub(a,b) return {a[1]-b[1],a[2]-b[2],a[3]-b[3]} end\n  local function norm(v) local l=math.sqrt(v[1]^2+v[2]^2+v[3]^2); if l==0 then return {0,0,0} end; return {v[1]/l,v[2]/l,v[3]/l} end\n  local function cross(a,b) return {a[2]*b[3]-a[3]*b[2],a[3]*b[1]-a[1]*b[3],a[1]*b[2]-a[2]*b[1]} end\n  local function dot(a,b) return a[1]*b[1]+a[2]*b[2]+a[3]*b[3] end\n  local fw=norm(sub(target,eye)); local rt=norm(cross(fw,up)); local tu=cross(rt,fw)\n  return {rt[1],rt[2],rt[3],-dot(rt,eye), tu[1],tu[2],tu[3],-dot(tu,eye), -fw[1],-fw[2],-fw[3],dot(fw,eye), 0,0,0,1}\nend\n\nfunction GoldCompat.drawStadiumUiPortrait(game,mon,x,y,w,h)\n  if not stadiumUiOptionEnabled() or type(mon)~="table" then return false end\n  local def=game and game.data and game.data.pokemon and mon.species and game.data.pokemon[mon.species]\n  local dex=def and tonumber(def.dex)\n  if not dex or dex<1 or dex>151 then return false end\n  if not (modRef and type(modRef.find)=="function") then return false end\n\n  local stadium=nil\n  local okFind,value=pcall(modRef.find,"STADIUM_BATTLE_FX")\n  if okFind then stadium=value end\n  if not stadium then\n    okFind,value=pcall(modRef.find,modRef,"STADIUM_BATTLE_FX")\n    if okFind then stadium=value end\n  end\n  local models=stadium and stadium.exports and stadium.exports.models\n  if not (models and tonumber(models.version)==1 and type(models.acquire)=="function" and type(models.withRenderer)=="function") then return false end\n  local source=models.SELECTED or "selected"\n  if type(models.available)=="function" then\n    local okAvail,avail=pcall(models.available,source,dex)\n    if not (okAvail and avail) then return false end\n  end\n\n  local variant=GoldCompat.pokemonIsShiny(mon) and "shiny" or "normal"\n  local cache=GoldCompat.__stadiumUiActor\n  if cache and (cache.dex~=dex or cache.variant~=variant or cache.models~=models) then\n    if cache.actor and type(cache.actor.release)=="function" then pcall(cache.actor.release,cache.actor) end\n    GoldCompat.__stadiumUiActor=nil; cache=nil\n  end\n  if not cache then\n    local okActor,actor,err=pcall(models.acquire,source,dex,variant,{side="external"})\n    if not (okActor and actor) then return false end\n    cache={actor=actor,dex=dex,variant=variant,models=models,lastClock=nil}\n    GoldCompat.__stadiumUiActor=cache\n  end\n  local actor=cache.actor\n  if not actor then return false end\n\n  local G=love and love.graphics\n  if not (G and G.newCanvas and G.setCanvas and G.draw) then return false end\n  local canvas=GoldCompat.__stadiumUiCanvas\n  if not canvas then\n    local okCanvas,c=pcall(G.newCanvas,160,160,{format="rgba8",readable=true})\n    if not (okCanvas and c) then return false end\n    GoldCompat.__stadiumUiCanvas=c; canvas=c\n  end\n\n  local wh=tonumber(type(actor.worldHeight)=="function" and actor:worldHeight() or nil) or 32\n  local wr=tonumber(type(actor.worldRadius)=="function" and actor:worldRadius() or nil) or wh*0.42\n  local bound=math.max(4,wh*0.52,wr)\n  local centre=wh*0.5\n  local fov=math.rad(30)\n  local distance=(bound/math.tan(fov/2))*1.55\n  local view=uiLookAt({0,centre,distance},{0,centre,0},{0,1,0})\n  local proj=uiPerspective(fov,1,0.1,math.max(500,distance+bound*8))\n  local vp=uiMatMul(proj,view)\n\n  local now=(love.timer and love.timer.getTime and love.timer.getTime()) or os.clock()\n  local dt=cache.lastClock and math.max(0,math.min(0.1,now-cache.lastClock)) or 0\n  cache.lastClock=now\n  if type(actor.update)=="function" then pcall(actor.update,actor,dt) end\n  if type(actor.play)=="function" and not cache.idleStarted then pcall(actor.play,actor,"idle"); cache.idleStarted=true end\n  local matrix=nil\n  local okMatrix,m=pcall(actor.matrix,actor,0,0,0,0,1)\n  if okMatrix then matrix=m end\n  if not matrix then return false end\n\n  local oldCanvas=nil\n  if G.getCanvas then pcall(function() oldCanvas=G.getCanvas() end) end\n  local pushed=false\n  if G.push then pushed=pcall(G.push,"all") end\n  local okRender=pcall(function()\n    G.setCanvas({canvas,depthstencil=true})\n    G.clear(0,0,0,0,1,0)\n    local okRenderer,drew=models.withRenderer(vp,function()\n      if type(actor.build)=="function" then pcall(actor.build,actor) end\n      if type(actor.draw)=="function" then return actor:draw(matrix,0) end\n      return false\n    end)\n    if not okRenderer or drew==false then error("stadium model draw declined") end\n  end)\n  if oldCanvas then pcall(G.setCanvas,oldCanvas) else pcall(G.setCanvas) end\n  if pushed then pcall(G.pop) end\n  if not okRender then return false end\n\n  G.push("all"); G.origin(); G.setShader(); G.setColor(1,1,1,1)\n  local sx,sy,sw,sh=G.getScissor()\n  local cx,cy,cw,ch=x,y,w,h\n  if sx then local rx,ry=math.max(cx,sx),math.max(cy,sy); local rr,rb=math.min(cx+cw,sx+sw),math.min(cy+ch,sy+sh); cx,cy,cw,ch=rx,ry,math.max(0,rr-rx),math.max(0,rb-ry) end\n  G.setScissor(cx,cy,cw,ch)\n  local inset=math.max(0,math.min(2,math.floor(math.min(w,h)*0.03)))\n  G.draw(canvas,x+inset,y+inset,0,(w-inset*2)/160,(h-inset*2)/160)\n  local okPalette,PaletteFX=pcall(require,"src.render.PaletteFX")\n  if okPalette and PaletteFX and type(PaletteFX.markTrueColor)=="function" then pcall(PaletteFX.markTrueColor,x,y,w,h) end\n  G.pop()\n  return true\nend\n\n'''
+          s=s.replace('function GoldCompat.drawCleanResolvedPortrait(game,mon,x,y,w,h,kind)\n',stadium_code+'function GoldCompat.drawCleanResolvedPortrait(game,mon,x,y,w,h,kind)\n',1)
+
+          # Try Stadium only on Summary/Pokédex.  PC and every other caller are untouched.
+          replace_once(
+              'function GoldCompat.drawCleanResolvedPortrait(game,mon,x,y,w,h,kind)\n  local ok,image,meta=pcall(spritePortraitResolver.resolve,game,mon,kind)',
+              'function GoldCompat.drawCleanResolvedPortrait(game,mon,x,y,w,h,kind)\n  if (kind=="summary" or kind=="dex") then\n    local ok3d,drew3d=pcall(GoldCompat.drawStadiumUiPortrait,game,mon,x,y,w,h)\n    if ok3d and drew3d then return true end\n  end\n  local ok,image,meta=pcall(spritePortraitResolver.resolve,game,mon,kind)',
+              'Stadium-first portrait seam')
+
+          # Boolean test option: OFF = existing resolved sprites; ON = Stadium 3D
+          # where available, with automatic sprite fallback.
+          replace_once(
+              '  battlePortraits = true,\n  colosseumPokemonMenu = true,',
+              '  battlePortraits = true,\n  stadiumUiModels = false,\n  colosseumPokemonMenu = true,',
+              'stadium option default')
+          replace_once(
+              '  {key="battlePortraits",label="BATTLE PORTRAITS",kind="toggle"},\n  {key="colosseumPokemonMenu",label="POKéMON MENU",kind="toggle"},',
+              '  {key="battlePortraits",label="BATTLE PORTRAITS",kind="toggle"},\n  {key="stadiumUiModels",label="STADIUM 3D MODELS",kind="toggle"},\n  {key="colosseumPokemonMenu",label="POKéMON MENU",kind="toggle"},',
+              'stadium UI row')
+
+          # Add the launcher option schema beside Battle Portraits using the exact
+          # formatting present in the validated build.
+          pat=re.compile(r'(\{\s*key\s*=\s*"battlePortraits",\s*type\s*=\s*"toggle",\s*label\s*=\s*"BATTLE PORTRAITS",\s*default\s*=\s*true,\s*\},)',re.S)
+          m=pat.search(s)
+          if not m: raise SystemExit('battlePortraits schema anchor not found')
+          addition=m.group(1)+'\n    {\n      key = "stadiumUiModels",\n      type = "toggle",\n      label = "STADIUM 3D MODELS",\n      default = false,\n    },'
+          s=s[:m.start()]+addition+s[m.end():]
+
+          if s==original: raise SystemExit('no source changes made')
+          p.write_text(s,encoding='utf-8')
+
+          manifest=root/'manifest.json'
+          data=json.loads(manifest.read_text(encoding='utf-8'))
+          data['version']='2.0.3-test1-ui-fixes-stadium'
+          manifest.write_text(json.dumps(data,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
+
+          notes=root/'TEST_BUILD_NOTES.txt'
+          notes.write_text('''Colosseum Inspired UI Overhaul 2.0.3-test1\n\nTest scope:\n- Gen I startup player/rival naming visibility ownership fix\n- shared shiny detection for boolean + Gen II DV shininess\n- Raticate (#020) wrong packaged portrait fails open to correct resolved art\n- UI Settings > STADIUM 3D MODELS toggle (default OFF)\n  * ON affects Pokémon Summary and Pokédex previews only\n  * uses StadiumBattleFX public Model API v1 / selected model source\n  * requests shiny model variants\n  * unavailable models/errors fall back to current resolved sprite\n  * battle presentation and PC remain untouched\n\nThis is an isolated test build. It is not a GitHub release.\n''',encoding='utf-8')
+          PY
+          python3 /tmp/ui-test/patch.py
+
+      - name: Static validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lua5.4 >/dev/null
+          lua5.4 -e 'assert(loadfile("/tmp/ui-test/base/main.lua"))'
+          jq -e '.version == "2.0.3-test1-ui-fixes-stadium" and .entry == "main.lua"' /tmp/ui-test/base/manifest.json >/dev/null
+          grep -q 'function SafeIntroNaming:draw()' /tmp/ui-test/base/main.lua
+          grep -q 'pokemonIsShiny' /tmp/ui-test/base/main.lua
+          grep -q 'dex==20 then return nil' /tmp/ui-test/base/main.lua
+          grep -q 'STADIUM 3D MODELS' /tmp/ui-test/base/main.lua
+          grep -q 'models.withRenderer' /tmp/ui-test/base/main.lua
+          echo 'STATIC VALIDATION PASS'
+
+      - name: Package test build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/ui-test/base
+          zip -qr /tmp/ui-test/Colosseum-Inspired-UI-Overhaul-2.0.3-test1-ui-fixes-stadium.zip .
+          unzip -t /tmp/ui-test/Colosseum-Inspired-UI-Overhaul-2.0.3-test1-ui-fixes-stadium.zip >/dev/null
+          sha256sum /tmp/ui-test/Colosseum-Inspired-UI-Overhaul-2.0.3-test1-ui-fixes-stadium.zip | tee /tmp/ui-test/test-build.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Colosseum-UI-2.0.3-test1-ui-fixes-stadium
+          path: |
+            /tmp/ui-test/Colosseum-Inspired-UI-Overhaul-2.0.3-test1-ui-fixes-stadium.zip
+            /tmp/ui-test/test-build.sha256
+          if-no-files-found: error
+          retention-days: 7
