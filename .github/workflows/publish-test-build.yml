@@ -1,0 +1,75 @@
+name: Publish isolated validated test build
+
+on:
+  push:
+    branches: ['test/ui-fixes-stadium-display-20260821']
+    paths: ['.github/workflows/publish-test-build.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish-test-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: test/ui-fixes-stadium-display-20260821
+          fetch-depth: 0
+
+      - name: Download SHA-locked 2.0.2 baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET: Colosseum-Inspired-UI-Overhaul-2.0.2.zip
+          TAG: v2.0.0
+          EXPECTED_SHA256: 9ab6b3fe03306dd70ad0b6673f7b7850fe3f0d732496fbab23c459a6c458347e
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/ui-test && mkdir -p /tmp/ui-test/base
+          gh release download "$TAG" --pattern "$ASSET" --dir /tmp/ui-test
+          test "$(sha256sum "/tmp/ui-test/$ASSET" | awk '{print $1}')" = "$EXPECTED_SHA256"
+          unzip -q "/tmp/ui-test/$ASSET" -d /tmp/ui-test/base
+          test "$(jq -r '.version' /tmp/ui-test/base/manifest.json)" = '2.0.2'
+
+      - name: Reuse test patch from build harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          awk '/cat > \/tmp\/ui-test\/patch.py <<'\''PY'\''/{take=1;next} take && /^          PY$/{exit} take{sub(/^          /,""); print}' \
+            .github/workflows/test-ui-fixes.yml > /tmp/ui-test/patch.py
+          test -s /tmp/ui-test/patch.py
+          python3 /tmp/ui-test/patch.py
+
+      - name: Validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lua5.4 >/dev/null
+          lua5.4 -e 'assert(loadfile("/tmp/ui-test/base/main.lua"))'
+          jq -e '.version == "2.0.3-test1-ui-fixes-stadium" and .entry == "main.lua"' /tmp/ui-test/base/manifest.json >/dev/null
+          grep -q 'function SafeIntroNaming:draw()' /tmp/ui-test/base/main.lua
+          grep -q 'pokemonIsShiny' /tmp/ui-test/base/main.lua
+          grep -q 'dex==20 then return nil' /tmp/ui-test/base/main.lua
+          grep -q 'STADIUM 3D MODELS' /tmp/ui-test/base/main.lua
+          grep -q 'models.withRenderer' /tmp/ui-test/base/main.lua
+          cd /tmp/ui-test/base
+          zip -qr /tmp/ui-test/Colosseum-Inspired-UI-Overhaul-2.0.3-test1-ui-fixes-stadium.zip .
+          unzip -t /tmp/ui-test/Colosseum-Inspired-UI-Overhaul-2.0.3-test1-ui-fixes-stadium.zip >/dev/null
+          sha256sum /tmp/ui-test/Colosseum-Inspired-UI-Overhaul-2.0.3-test1-ui-fixes-stadium.zip > /tmp/ui-test/test-build.sha256
+
+      - name: Commit test artifact to isolated branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-builds
+          cp /tmp/ui-test/Colosseum-Inspired-UI-Overhaul-2.0.3-test1-ui-fixes-stadium.zip test-builds/
+          cp /tmp/ui-test/test-build.sha256 test-builds/Colosseum-Inspired-UI-Overhaul-2.0.3-test1-ui-fixes-stadium.zip.sha256
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add test-builds/
+          git diff --cached --quiet && exit 0
+          git commit -m 'Add isolated 2.0.3 test1 UI fixes build'
+          git push origin HEAD:test/ui-fixes-stadium-display-20260821
