@@ -3,7 +3,7 @@ name: Publish isolated validated test build
 on:
   push:
     branches: ['test/ui-fixes-stadium-display-20260821']
-    paths: ['.github/workflows/publish-test-build.yml']
+    paths: ['.github/workflows/publish-test-build.yml', '.test-ui-fixes-trigger']
   workflow_dispatch:
 
 permissions:
