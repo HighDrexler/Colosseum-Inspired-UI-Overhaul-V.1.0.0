@@ -12342,7 +12342,241 @@ function GoldCompat.prepareCleanResolvedPortrait(image,sourceMeta)
   return prepared.image,prepared.meta
 end
 
+-- -------------------------------------------------------------------------
+-- Optional Stadium 3D models for Pokemon information surfaces.
+--
+-- StadiumBattleFX owns extraction, source selection, actor lifetime internals,
+-- skeletal animation and rendering. This UI consumes only its public v1 model
+-- service. If Stadium is not the selected model provider, the service is not
+-- ready, or a species is outside the exported model range, the existing
+-- spritePortraitResolver path below remains authoritative.
+-- -------------------------------------------------------------------------
+GoldCompat.__stadiumUiActors=GoldCompat.__stadiumUiActors or {}
+
+function GoldCompat.releaseStadiumUiActor(kind)
+  local slots=GoldCompat.__stadiumUiActors
+  local entry=slots and slots[kind]
+  if not entry then return end
+  if entry.actor and type(entry.actor.release)=="function" then
+    pcall(entry.actor.release,entry.actor)
+  end
+  slots[kind]=nil
+end
+
+function GoldCompat.stadiumUiModelService(game)
+  if not (modRef and type(modRef.find)=="function") then return nil end
+  local ok,handle=pcall(modRef.find,"STADIUM_BATTLE_FX")
+  if not ok or not handle then
+    ok,handle=pcall(modRef.find,modRef,"STADIUM_BATTLE_FX")
+  end
+  if not (ok and handle and type(handle.exports)=="table") then return nil end
+
+  local exports=handle.exports
+  local models=exports.models
+  if not (type(models)=="table" and tonumber(models.version or 0)>=1
+      and type(models.available)=="function"
+      and type(models.acquire)=="function"
+      and type(models.draw)=="function") then
+    return nil
+  end
+
+  -- Respect the user's selected battle-model provider. Merely installing
+  -- StadiumBattleFX is not permission to replace another selected model source.
+  local battles=exports.battles
+  if type(battles)=="table" and exports.modelProvider
+      and type(battles.resolve)=="function" then
+    local resolvedOk,resolved=pcall(battles.resolve,battles,"models",{game=game})
+    if resolvedOk and resolved and resolved~=exports.modelProvider then return nil end
+  end
+  return models,exports
+end
+
+function GoldCompat.stadiumUiDexNumber(game,mon)
+  local species=mon and (mon.species or mon.id)
+  local def=species and game and game.data and game.data.pokemon
+    and game.data.pokemon[species]
+  local dex=def and tonumber(def.dex)
+  if not dex then return nil end
+  return math.floor(dex)
+end
+
+function GoldCompat.stadiumUiVariant(mon)
+  if mon and (mon.shiny==true or mon.isShiny==true) then return "shiny" end
+  local dvs=mon and mon.dvs
+  if type(dvs)=="table" then
+    local okStats,Stats=pcall(require,"src.pokemon.Stats")
+    if okStats and Stats and type(Stats.isShiny)=="function" then
+      local ok,value=pcall(Stats.isShiny,dvs)
+      if ok and value then return "shiny" end
+    end
+  end
+  return "normal"
+end
+
+function GoldCompat.stadiumUiMatMul(a,b)
+  local out={}
+  for r=0,3 do
+    local a0,a1=a[r*4+1],a[r*4+2]
+    local a2,a3=a[r*4+3],a[r*4+4]
+    for c=1,4 do
+      out[r*4+c]=a0*b[c]+a1*b[4+c]+a2*b[8+c]+a3*b[12+c]
+    end
+  end
+  return out
+end
+
+function GoldCompat.stadiumUiPerspective(fovY,aspect,near,far)
+  local f=1/math.tan(fovY/2)
+  local d=near-far
+  return {f/aspect,0,0,0, 0,f,0,0,
+    0,0,(far+near)/d,(2*far*near)/d, 0,0,-1,0}
+end
+
+function GoldCompat.stadiumUiLookAt(eye,target)
+  local function sub(a,b) return {a[1]-b[1],a[2]-b[2],a[3]-b[3]} end
+  local function norm(v)
+    local len=math.sqrt(v[1]*v[1]+v[2]*v[2]+v[3]*v[3])
+    if len<=1e-9 then return {0,0,0} end
+    return {v[1]/len,v[2]/len,v[3]/len}
+  end
+  local function cross(a,b)
+    return {a[2]*b[3]-a[3]*b[2],a[3]*b[1]-a[1]*b[3],
+      a[1]*b[2]-a[2]*b[1]}
+  end
+  local function dot(a,b) return a[1]*b[1]+a[2]*b[2]+a[3]*b[3] end
+  local forward=norm(sub(target,eye))
+  local right=norm(cross(forward,{0,1,0}))
+  local up=cross(right,forward)
+  return {right[1],right[2],right[3],-dot(right,eye),
+    up[1],up[2],up[3],-dot(up,eye),
+    -forward[1],-forward[2],-forward[3],dot(forward,eye),
+    0,0,0,1}
+end
+
+function GoldCompat.stadiumUiViewProjection(actor,width,height)
+  local modelH=math.max(1,tonumber(actor and actor.worldHeight
+    and actor:worldHeight()) or 32)
+  local radius=math.max(1,tonumber(actor and actor.worldRadius
+    and actor:worldRadius()) or modelH*0.35)
+  local aspect=math.max(0.2,width/math.max(1,height))
+  local frameH=math.max(modelH*1.16,(radius*2.35)/aspect)
+  local fov=math.rad(28)
+  local distance=(frameH*0.5)/math.tan(fov*0.5)
+  local focus={0,modelH*0.48,0}
+  local eye={radius*0.30,modelH*0.53,distance}
+  local projection=GoldCompat.stadiumUiPerspective(
+    fov,aspect,math.max(0.1,distance*0.02),distance*5)
+  -- Stadium's public renderer follows the battle host's screen-Y convention.
+  projection=GoldCompat.stadiumUiMatMul(
+    {1,0,0,0, 0,-1,0,0, 0,0,1,0, 0,0,0,1},projection)
+  return GoldCompat.stadiumUiMatMul(
+    projection,GoldCompat.stadiumUiLookAt(eye,focus))
+end
+
+function GoldCompat.drawStadiumUiModel(game,mon,x,y,w,h,kind)
+  if kind~="summary" and kind~="dex" then return false end
+  if not (game and mon and love and love.graphics) then return false end
+
+  local models,exports=GoldCompat.stadiumUiModelService(game)
+  if not models then
+    GoldCompat.releaseStadiumUiActor(kind)
+    return false
+  end
+
+  local dex=GoldCompat.stadiumUiDexNumber(game,mon)
+  local maxSpecies=tonumber(models.speciesCount) or 0
+  if not dex or dex<1 or (maxSpecies>0 and dex>maxSpecies) then
+    GoldCompat.releaseStadiumUiActor(kind)
+    return false
+  end
+
+  local source=models.SELECTED or "selected"
+  local availableOk,available=pcall(models.available,source,dex)
+  if not (availableOk and available) then
+    GoldCompat.releaseStadiumUiActor(kind)
+    return false
+  end
+
+  local sourceToken=source
+  local sources=exports and exports.modelSources
+  if type(sources)=="table" and type(sources.selectedId)=="function" then
+    local tokenOk,value=pcall(sources.selectedId)
+    if tokenOk and value then sourceToken=tostring(value) end
+  end
+  local variant=GoldCompat.stadiumUiVariant(mon)
+  local slots=GoldCompat.__stadiumUiActors
+  local entry=slots[kind]
+  if entry and (entry.dex~=dex or entry.variant~=variant
+      or entry.sourceToken~=sourceToken or entry.models~=models) then
+    GoldCompat.releaseStadiumUiActor(kind)
+    entry=nil
+  end
+
+  if not entry then
+    local acquireOk,actor=pcall(models.acquire,source,dex,variant,{side="external"})
+    if not (acquireOk and actor) then return false end
+    entry={actor=actor,dex=dex,variant=variant,sourceToken=sourceToken,
+      models=models,lastTime=nil,canvas=nil,canvasW=0,canvasH=0}
+    slots[kind]=entry
+    if type(actor.play)=="function" then pcall(actor.play,actor,"idle") end
+  end
+
+  local actor=entry.actor
+  if not actor then return false end
+  local now=(love.timer and love.timer.getTime and love.timer.getTime()) or 0
+  local dt=entry.lastTime and math.max(0,math.min(0.05,now-entry.lastTime)) or 0
+  entry.lastTime=now
+  if type(actor.update)=="function" then pcall(actor.update,actor,dt) end
+
+  local G=love.graphics
+  local px1,py1=x,y
+  local px2,py2=x+w,y+h
+  if type(G.transformPoint)=="function" then
+    local ok1,a,b=pcall(G.transformPoint,x,y)
+    local ok2,c,d=pcall(G.transformPoint,x+w,y+h)
+    if ok1 and ok2 then px1,py1,px2,py2=a,b,c,d end
+  end
+  local canvasW=math.max(64,math.min(512,math.floor(math.abs(px2-px1)+0.5)))
+  local canvasH=math.max(64,math.min(512,math.floor(math.abs(py2-py1)+0.5)))
+  if not entry.canvas or entry.canvasW~=canvasW or entry.canvasH~=canvasH then
+    local canvasOk,canvas=pcall(G.newCanvas,canvasW,canvasH,{dpiscale=1})
+    if not (canvasOk and canvas) then return false end
+    entry.canvas,entry.canvasW,entry.canvasH=canvas,canvasW,canvasH
+  end
+
+  local priorCanvas=G.getCanvas and G.getCanvas() or nil
+  G.push("all")
+  local renderOk=pcall(function()
+    G.setCanvas({entry.canvas,depth=true})
+    G.origin()
+    G.clear(0,0,0,0,true,true)
+    local vp=GoldCompat.stadiumUiViewProjection(actor,canvasW,canvasH)
+    local matrix=actor.matrix and actor:matrix(0,0,0,0,1) or nil
+    if not matrix then error("Stadium UI model matrix unavailable") end
+    local okDraw,drew=models.draw(actor,vp,matrix,0)
+    if not okDraw or drew==false then
+      error("Stadium UI model draw failed: "..tostring(drew))
+    end
+  end)
+  if priorCanvas then G.setCanvas(priorCanvas) else G.setCanvas() end
+  G.pop()
+  if not renderOk then return false end
+
+  G.push("all")
+  G.setColor(1,1,1,1)
+  G.draw(entry.canvas,x,y,0,w/canvasW,h/canvasH)
+  G.pop()
+  return true
+end
+
 function GoldCompat.drawCleanResolvedPortrait(game,mon,x,y,w,h,kind)
+  -- Information surfaces prefer the active Stadium 3D model when the
+  -- Stadium provider is selected. Every failure falls through to the existing
+  -- resolved-sprite path, preserving Battle Arts, Crystal and custom packs.
+  local stadiumOk,stadiumDrew=pcall(
+    GoldCompat.drawStadiumUiModel,game,mon,x,y,w,h,kind)
+  if stadiumOk and stadiumDrew then return true end
+
   local ok,image,meta=pcall(spritePortraitResolver.resolve,game,mon,kind)
   if not (ok and image) then return false end
   image,meta=GoldCompat.prepareCleanResolvedPortrait(image,meta)
@@ -16957,112 +17191,12 @@ function GoldCompat.installCrossgenFlowUI()
     end
   end
 
-  -- Gold's VM is constructed when the World is created, before a normal mod
-  -- install callback gets here. Wrapping Vm.new at this point is therefore too
-  -- late for the live save and was why the previous starter nickname hotfix
-  -- never reached Elm's actual GivePoke command. Patch the LIVE VM instance
-  -- instead, and defer UI creation until World:step has finished the script
-  -- tick that awarded the starter. That keeps the VM authoritative and avoids
-  -- mutating the state stack from inside the give command itself.
-  function GoldCompat.ensureGen2StarterNicknameVm(world)
-    if GoldCompat.generation~="gen2" then return end
-    local vm=world and world.vm
-    if not (vm and type(vm.givePokeFn)=="function")
-        or vm.__colosseumStarterNicknameWrapped then return end
-
-    vm.__colosseumStarterNicknameWrapped=true
-    vm.__colosseumOriginalGivePokeFn=vm.givePokeFn
-    vm.givePokeFn=function(speciesIndex,level,item)
-      local game=world.game or GoldCompat.game
-      local party=game and game.save and game.save.party
-      local before=type(party)=="table" and #party or 0
-      local result=vm.__colosseumOriginalGivePokeFn(speciesIndex,level,item)
-      party=game and game.save and game.save.party
-      local mon=(type(party)=="table" and #party>before) and party[#party] or nil
-      local starters={CHIKORITA=true,CYNDAQUIL=true,TOTODILE=true}
-      local mapId=world.map and (world.map.id or world.map.name)
-      if mon and tostring(mapId or ""):upper()=="ELMS_LAB"
-          and starters[tostring(mon.species or ""):upper()]
-          and not mon.nickname then
-        State.pendingGen2StarterNickname={
-          game=game,world=world,mon=mon,
-          species=tostring(mon.species or ""),
-        }
-      end
-      return result
-    end
-  end
-
-  function GoldCompat.flushGen2StarterNickname(world)
-    local pending=State.pendingGen2StarterNickname
-    if not pending or pending.world~=world or pending.pushed then return end
-    local game=pending.game or (world and world.game) or GoldCompat.game
-    local mon=pending.mon
-    if not (game and game.stack and mon) then
-      State.pendingGen2StarterNickname=nil
-      return
-    end
-
-    pending.pushed=true
-    local def=game.data and game.data.pokemon and game.data.pokemon[mon.species]
-    local display=tostring((def and def.name) or mon.species or "POKéMON")
-    local prompt=TextBox.new(game,
-      Strings("Do you want to\ngive a nickname\nto %s?",display),nil,{
-        instant=true,
-        choice=function(yes)
-          if not yes then
-            State.pendingGen2StarterNickname=nil
-            return
-          end
-          local okNaming,Naming2=pcall(require,"src.ui.gen2.NamingScreen")
-          if not (okNaming and Naming2 and type(Naming2.new)=="function") then
-            State.pendingGen2StarterNickname=nil
-            return
-          end
-          local state
-          state=Naming2.new(game,{
-            type="nickname",
-            monName=display,
-            maxLength=10,
-            onDone=function(name)
-              if game.stack and game.stack:top()==state then game.stack:pop() end
-              if name and tostring(name):gsub(" ","")~="" then
-                mon.nickname=name
-              end
-              State.pendingGen2StarterNickname=nil
-            end,
-            onCancel=function()
-              if game.stack and game.stack:top()==state then game.stack:pop() end
-              State.pendingGen2StarterNickname=nil
-            end,
-          })
-          state.__colosseumFlowKind="naming"
-          state.__colosseumStarterNaming=true
-          game.stack:push(state)
-        end,
-      })
-    prompt.__colosseumNicknamePrompt=true
-    prompt.__colosseumGen2StarterNickname=true
-    game.stack:push(prompt)
-  end
-
-  local okWorld2,World2=pcall(require,"src.world.gen2.World")
-  if okWorld2 and World2 and type(World2.step)=="function"
-      and not World2.__colosseumStarterNicknameStepPatched then
-    World2.__colosseumStarterNicknameStepPatched=true
-    World2.__colosseumOriginalStarterNicknameStep=World2.step
-    World2.step=function(self,...)
-      GoldCompat.ensureGen2StarterNicknameVm(self)
-      local result=World2.__colosseumOriginalStarterNicknameStep(self,...)
-      GoldCompat.flushGen2StarterNickname(self)
-      return result
-    end
-  end
-
-  -- If the world already exists when the mod is installed, arm its live VM
-  -- immediately; future worlds are covered by the World:step wrapper above.
-  local liveWorld=GoldCompat.game and (GoldCompat.game.world or GoldCompat.game.overworld)
-  if liveWorld then GoldCompat.ensureGen2StarterNicknameVm(liveWorld) end
+  -- Gen II nickname lifecycle is engine-owned. Current Gen2Recomp's
+  -- givepoke path calls Specials.askNickname(), which keeps the script VM
+  -- suspended until its native YES/NO and NamingScreen callbacks complete.
+  -- This mod deliberately does not wrap givePokeFn or World:step here: doing
+  -- so duplicates the nickname flow and can resume the overworld out of order.
+  -- The presentation adapter below still skins that native NamingScreen.
 
   -- Match the Gen II naming input to the presented board: on the standard
   -- upper-case page, the final two spare cells type gender symbols. Box naming
