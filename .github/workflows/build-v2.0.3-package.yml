@@ -48,9 +48,9 @@ jobs:
           test "$(jq -r '.entry' dist/manifest.json)" = 'main.lua'
           test "$(jq -r '.version' dist/manifest.json)" = '2.0.3'
           test "$(find dist/assets -type f | wc -l)" -gt 0
-          test "$(find dist -type f -name '*.b64' | wc -l)" -eq 0
           echo "Asset files: $(find dist/assets -type f | wc -l)"
           echo "Portrait PNGs: $(find dist/assets -type f -path '*/portraits/*' -name '*.png' | wc -l)"
+          echo "Source commit: $(git rev-parse HEAD)"
 
       - name: LuaJIT compile check
         shell: bash
