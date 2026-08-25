@@ -20809,7 +20809,29 @@ function GoldCompat.enemyBallsRemaining(state)
   return n,#party
 end
 
+function GoldCompat.cbeOwnsEnemyTrainer(state)
+  if not (state and state.battle and not state.battle.wild) then return false end
+  if not (modRef and type(modRef.find)=="function") then return false end
+  local ok,handle=pcall(modRef.find,"COLOSSEUM_BATTLE_ENVIRONMENTS")
+  if not ok or not handle then
+    ok,handle=pcall(modRef.find,modRef,"COLOSSEUM_BATTLE_ENVIRONMENTS")
+  end
+  if not (ok and handle and type(handle.exports)=="table"
+      and type(handle.exports.status)=="function") then return false end
+  local statusOk,status=pcall(handle.exports.status)
+  if not (statusOk and type(status)=="table") then return false end
+  local trainer=status.trainer
+  return type(trainer)=="table" and trainer.active==true
+end
+
 function GoldCompat.drawGoldTrainerSwitchOverlay(state)
+  -- CBE already owns native trainer-picture suppression when its 3D enemy
+  -- actor is live. Do not bypass that contract by redrawing Gold's raw
+  -- trainer frontpic during the KO/replacement handoff.
+  if GoldCompat.cbeOwnsEnemyTrainer(state) then
+    if state then state.__gen3uiTrainerSwitch=nil end
+    return false
+  end
   local tr=state and state.__gen3uiTrainerSwitch
   if not (tr and state.enemyTrainerImage) then return false end
 
@@ -21010,7 +21032,14 @@ function GoldCompat.installGoldBattlePresentation()
   end
 
   GoldBattleState.offerShiftSwitch=function(self,mon,...)
-    self.__gen3uiTrainerSwitch={mode="in",frame=0}
+    -- Keep the stock Gold trainer-switch flourish only when no external 3D
+    -- trainer provider owns the enemy actor. CBE's live trainer must remain
+    -- authoritative through lethal damage, the shift prompt and send-out.
+    if GoldCompat.cbeOwnsEnemyTrainer(self) then
+      self.__gen3uiTrainerSwitch=nil
+    else
+      self.__gen3uiTrainerSwitch={mode="in",frame=0}
+    end
     return GoldBattleState.__gen3uiOriginalOfferShiftSwitch(self,mon,...)
   end
 
