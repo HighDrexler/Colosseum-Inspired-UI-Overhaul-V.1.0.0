@@ -1,11 +1,41 @@
-name: Validate patch runner
+name: Apply Colosseum UI compatibility patch
 
 on:
   push:
     branches: ["fix/gen2-nickname-stadium-ui-models"]
 
+permissions:
+  contents: write
+
 jobs:
-  validate:
+  patch:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "runner available"
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/gen2-nickname-stadium-ui-models
+          fetch-depth: 0
+
+      - name: Patch main.lua
+        run: python3 tools/one_shot_patch_colosseum.py
+
+      - name: Syntax and regression checks
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq luajit
+          luajit -b main.lua /tmp/colosseum-main.luac
+          ! grep -q 'ensureGen2StarterNicknameVm\|flushGen2StarterNickname\|pendingGen2StarterNickname' main.lua
+          grep -q 'src.ui.gen2.NamingScreen' main.lua
+          grep -q 'function GoldCompat.drawStadiumUiModel' main.lua
+          grep -q 'models.SELECTED' main.lua
+
+      - name: Commit patch and remove one-shot files
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/patch-gen2-nickname-stadium-ui.yml tools/one_shot_patch_colosseum.py
+          git add main.lua
+          git commit -m "fix: restore native Gen 2 naming and add Stadium UI models"
+          git push origin HEAD:fix/gen2-nickname-stadium-ui-models
