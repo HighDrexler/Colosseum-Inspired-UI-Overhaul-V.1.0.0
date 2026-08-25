@@ -1,0 +1,84 @@
+name: Build Colosseum UI v2.0.3 package
+
+on:
+  push:
+    branches:
+      - build/v2.0.3-package
+    paths:
+      - '.github/workflows/build-v2.0.3-package.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PACKAGE: colosseum_ui_overhaul-2.0.3.zip
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: build/v2.0.3-package
+
+      - name: Build launcher-ready payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          mkdir -p dist
+          cp main.lua dist/main.lua
+          cp manifest.json dist/manifest.json
+          cp -a assets dist/assets
+          python3 - <<'PY'
+          import json
+          p='dist/manifest.json'
+          with open(p,'r',encoding='utf-8') as f:
+              data=json.load(f)
+          data['version']='2.0.3'
+          with open(p,'w',encoding='utf-8',newline='\n') as f:
+              json.dump(data,f,indent=2,ensure_ascii=False)
+              f.write('\n')
+          PY
+          test -s dist/main.lua
+          test -s dist/manifest.json
+          test -d dist/assets
+          test "$(jq -r '.id' dist/manifest.json)" = 'colosseum_ui_overhaul'
+          test "$(jq -r '.entry' dist/manifest.json)" = 'main.lua'
+          test "$(jq -r '.version' dist/manifest.json)" = '2.0.3'
+          test "$(find dist/assets -type f | wc -l)" -gt 0
+          echo "Asset files: $(find dist/assets -type f | wc -l)"
+          echo "Portrait PNGs: $(find dist/assets -type f -path '*/portraits/*' -name '*.png' | wc -l)"
+          echo "Source commit: $(git rev-parse HEAD)"
+
+      - name: LuaJIT compile check
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq luajit >/dev/null
+          luajit -b dist/main.lua /tmp/colosseum-ui-2.0.3.luac
+
+      - name: Create ZIP and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && zip -qr "../$PACKAGE" .)
+          unzip -t "$PACKAGE"
+          unzip -Z1 "$PACKAGE" | grep -qx 'main.lua'
+          unzip -Z1 "$PACKAGE" | grep -qx 'manifest.json'
+          unzip -Z1 "$PACKAGE" | grep -q '^assets/'
+          ! unzip -Z1 "$PACKAGE" | grep -q '^\.github/'
+          ! unzip -Z1 "$PACKAGE" | grep -q '^Colosseum-Inspired-UI-Overhaul'
+          sha256sum "$PACKAGE" > sha256sums.txt
+          cat sha256sums.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: colosseum-ui-v2.0.3-release
+          path: |
+            colosseum_ui_overhaul-2.0.3.zip
+            sha256sums.txt
+          if-no-files-found: error
+          retention-days: 7
