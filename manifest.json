@@ -1,9 +1,9 @@
 {
   "id": "colosseum_ui_overhaul",
   "name": "Colosseum Inspired UI Overhaul",
-  "version": "1.1.0",
+  "version": "2.2.1",
   "author": "Community",
-  "description": "Colosseum-inspired UI overhaul for Gen1Recomp with unified Gen I and Gen II presentation, battle HUDs, menus, PC, Pokédex, naming, evolution, area banners, and compatibility-focused presentation hooks while preserving native gameplay behavior.",
+  "description": "Colosseum-inspired UI overhaul for Gen1Recomp. 2.2.0 is a cross-generation performance and code-cleanup release: Gen I Pokédex 3D information models now reuse hot provider bindings and resident actors, render their private model canvas at a bounded 60 Hz, avoid legacy donor-skin interception, cache expensive Dex/typography/options/provider work, and retain the shared CBE/Stadium/Battle Arts/custom presentation architecture. It preserves the universal Gen II battle-overlay compositor fix, shiny support, Egg UI, fixed HUD/menu metrics, Gen I naming flow, and all existing Gen I/II compatibility.",
   "profile": "overhaul",
   "entry": "main.lua",
   "category": "UI",
@@ -15,7 +15,9 @@
     "DRAMATIC_SHAPE",
     "STADIUM_BATTLE_FX",
     "BATTLE_CINEMATICS",
-    "potato_voxel"
+    "potato_voxel",
+    "COLOSSEUM_BATTLE_ENVIRONMENTS",
+    "STADIUM2_OVERWORLD_MODELS"
   ],
   "conflicts": [
     "gen3_battle_ui"
@@ -33,4 +35,3 @@
   ],
   "github": "HighDrexler/Colosseum-Inspired-UI-Overhaul-V.1.0.0"
 }
-
