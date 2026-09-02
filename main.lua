@@ -65,6 +65,46 @@ local GoldCompat = {
   generation = "gen1",
 }
 
+-- Shiny identity is per-Pokemon state, not species presentation state. Gen II
+-- wrappers occasionally omit the convenience `shiny` boolean, so always fall
+-- back to the authoritative DV rule before resolving sprites, palettes, or
+-- Stadium model variants.
+function GoldCompat.monIsShiny(mon)
+  if type(mon)~="table" then return false end
+  if mon.shiny==true or mon.isShiny==true then return true end
+  local dvs=mon.dvs or mon.DVs or mon.ivs
+  if type(dvs)=="table" then
+    local Stats=GoldCompat.__statsModule
+    if Stats==nil then
+      local okStats,value=pcall(require,"src.pokemon.Stats")
+      Stats=(okStats and value) or false
+      GoldCompat.__statsModule=Stats
+    end
+    if Stats and type(Stats.isShiny)=="function" then
+      local ok,value=pcall(Stats.isShiny,dvs)
+      if ok and value==true then return true end
+    end
+  end
+  local nested=mon.mon or mon.pokemon or mon.partyMon
+  if type(nested)=="table" and nested~=mon then
+    return GoldCompat.monIsShiny(nested)
+  end
+  return false
+end
+
+-- Runtime sprite providers receive the live mon through pokemon.sprite. Avoid
+-- mutating engine-owned battle/party objects just to restore a missing shiny
+-- convenience flag; hand providers a shallow presentation proxy instead.
+function GoldCompat.spriteResolutionMon(mon)
+  if type(mon)~="table" or not GoldCompat.monIsShiny(mon)
+      or mon.shiny==true then return mon end
+  local proxy={}
+  for key,value in pairs(mon) do proxy[key]=value end
+  proxy.shiny=true
+  proxy.isShiny=true
+  return proxy
+end
+
 -- Safari ownership is shared by the embedded Colosseum renderer and the outer
 -- lifecycle/HUD adapters. Keep this resolver on GoldCompat so calls on either
 -- side of the renderer's nested scope use the same function.
@@ -105,8 +145,13 @@ function GoldCompat.experienceRatio(data,mon,generation,growthHint)
     or (dexEntry and (dexEntry.growthRate or dexEntry.growth))
   local cur,nxt
   if generation=="gen2" or mon.experience~=nil then
-    local okMon,Mon=pcall(require,"src.battle.gen2.Mon")
-    if okMon and Mon and type(Mon.experienceForLevel)=="function" then
+    local Mon=GoldCompat.__gen2MonModule
+    if Mon==nil then
+      local okMon,value=pcall(require,"src.battle.gen2.Mon")
+      Mon=(okMon and value) or false
+      GoldCompat.__gen2MonModule=Mon
+    end
+    if Mon and type(Mon.experienceForLevel)=="function" then
       -- Gold stores a growth-curve ID on the species record. Resolve that ID
       -- through Mon.growthFor before asking experienceForLevel; passing the ID
       -- itself silently falls back to a cubic curve and is why the Gen II HUD
@@ -353,7 +398,7 @@ local function colosseumIconFrame(game,mon)
     return nil
   end
 
-  local shiny=mon and (mon.shiny or mon.isShiny)
+  local shiny=GoldCompat.monIsShiny(mon)
   -- Alternate sheet frames often change facing rather than pose. Keep every
   -- species stable across battle, Party, and PC -- except Gloom (#044), whose
   -- harmless little side-to-side gag is intentionally retained.
@@ -534,6 +579,20 @@ local function text(str,x,y,size,color,align,width)
   else g.print(s,x,y) end
 end
 
+local function fitUiTextSize(str,desired,maxW,maxH,minSize)
+  desired=tonumber(desired) or 10
+  minSize=tonumber(minSize) or desired*0.48
+  local f=font(desired)
+  if not f then return desired end
+  local w=GoldCompat.measureFontWidth(f,str)
+  local h=f:getHeight()
+  local factor=1
+  if tonumber(maxW) and maxW>0 and w>maxW then factor=math.min(factor,maxW/w) end
+  if tonumber(maxH) and maxH>0 and h>maxH then factor=math.min(factor,maxH/h) end
+  if factor>=0.999 then return desired end
+  return math.max(minSize,desired*factor)
+end
+
 local function scaleForWindow()
   local sw,sh=love.graphics.getDimensions()
   return clamp(math.min(sw/1280,sh/720),0.72,1.75)
@@ -544,12 +603,9 @@ end
 -- battle-layout branch below is gated through this helper: desktop geometry
 -- remains byte-for-byte on the old path whenever Mobile Battle UI is off.
 local function mobileBattleUIEnabled()
-  local enabled=false
-  pcall(function()
-    enabled=modRef and modRef.options and modRef.options.get
-      and modRef.options:get("mobileBattleUI")==true or false
-  end)
-  return enabled
+  local read=GoldCompat and GoldCompat.optionValue
+  if type(read)=="function" then return read("mobileBattleUI")==true end
+  return false
 end
 
 -- Mobile-only bottom console dock. Commands, move selection, and battle
@@ -590,7 +646,7 @@ local function enginePortrait(game,mon)
   local def=game.data.pokemon and game.data.pokemon[mon.species]
   local vanillaPath=def and def.spriteFront
   local path,trueColor=PokemonSprites.path(
-    game.data,mon.species,"front",{mon=mon,kind="battle"}
+    game.data,mon.species,"front",{mon=GoldCompat.spriteResolutionMon(mon),kind="battle"}
   )
   -- Colosseum icons are optional presentation. When they are disabled the
   -- battle pod must still resolve the player's equipped sprite package, and
@@ -603,8 +659,8 @@ local function enginePortrait(game,mon)
   if game.data.gen2Palettes then
     local okPal,Palettes=pcall(require,"src.world.gen2.Palettes")
     colors=okPal and Palettes and Palettes.monColors
-      and Palettes.monColors(game.data.gen2Palettes,mon.species,mon.shiny) or nil
-    palName="gen2:"..tostring(mon.species)..":"..tostring(mon.shiny)
+      and Palettes.monColors(game.data.gen2Palettes,mon.species,GoldCompat.monIsShiny(mon)) or nil
+    palName="gen2:"..tostring(mon.species)..":"..tostring(GoldCompat.monIsShiny(mon))
   else
     palName,colors=paletteKey(game.data,mon.species)
   end
@@ -1040,6 +1096,43 @@ local function statusText(b)
   return tostring(s):upper()
 end
 
+local function colosseumBattleIsWild(battle)
+  if not battle then return false end
+  if battle.wild~=nil then return battle.wild==true end
+  local src=battle.__gen3Source
+  local core=src and src.battle
+  if core and core.wild~=nil then return core.wild==true end
+  return false
+end
+
+local function colosseumSpeciesCaught(game,battle,b)
+  if not colosseumBattleIsWild(battle) then return false end
+  local mon=b and (b.mon or b.live)
+  local species=mon and mon.species
+  local dex=game and game.save and game.save.pokedex
+  local owned=dex and (dex.caught or dex.owned)
+  return species~=nil and type(owned)=="table" and owned[species] and true or false
+end
+
+local function drawColosseumCaughtBall(cx,cy,r)
+  local G=love.graphics
+  r=math.max(3,r or 5)
+  G.push("all")
+  G.setColor(0.91,0.19,0.14,1)
+  G.arc("fill","pie",cx,cy,r,math.pi,math.pi*2)
+  G.setColor(0.98,0.98,0.94,1)
+  G.arc("fill","pie",cx,cy,r,0,math.pi)
+  G.setColor(0.055,0.065,0.060,1)
+  G.setLineWidth(math.max(1,r*0.18))
+  G.circle("line",cx,cy,r)
+  G.line(cx-r,cy,cx+r,cy)
+  G.setColor(0.98,0.98,0.94,1)
+  G.circle("fill",cx,cy,r*0.30)
+  G.setColor(0.055,0.065,0.060,1)
+  G.circle("line",cx,cy,r*0.30)
+  G.pop()
+end
+
 local function drawColosseumGenderGlyph(x,y,size,gender)
   if gender~="male" and gender~="female" then return false end
   local G=love.graphics
@@ -1066,6 +1159,80 @@ local function drawColosseumGenderGlyph(x,y,size,gender)
   return true
 end
 
+local COLOSSEUM_TYPE_COLORS={
+  NORMAL={0.56,0.56,0.48}, FIRE={0.88,0.28,0.16}, WATER={0.20,0.48,0.88},
+  ELECTRIC={0.92,0.72,0.12}, GRASS={0.30,0.68,0.22}, ICE={0.32,0.72,0.76},
+  FIGHTING={0.70,0.20,0.17}, POISON={0.56,0.28,0.62}, GROUND={0.72,0.57,0.28},
+  FLYING={0.45,0.55,0.82}, PSYCHIC={0.86,0.27,0.49}, BUG={0.57,0.64,0.16},
+  ROCK={0.62,0.53,0.25}, GHOST={0.38,0.32,0.56}, DRAGON={0.39,0.27,0.77},
+  DARK={0.36,0.29,0.25}, STEEL={0.56,0.58,0.66}, FAIRY={0.80,0.46,0.63},
+}
+
+local function colosseumBattlerTypeNames(game,b)
+  local mon=b and (b.mon or b) or nil
+  if not mon then return {} end
+  local def=game and game.data and game.data.pokemon
+    and game.data.pokemon[mon.species] or nil
+  local raw=(b and b.types) or mon.types or (def and def.types)
+  if type(raw)~="table" or #raw==0 then
+    raw={
+      (b and (b.type1 or b.type)) or mon.type1 or (def and def.type1),
+      (b and b.type2) or mon.type2 or (def and def.type2),
+    }
+  end
+  local out={}
+  for _,value in ipairs(raw or {}) do
+    local label=value
+    if type(value)=="table" then label=value.name or value.id or value.type end
+    if label~=nil then
+      label=tostring(label):upper():gsub("^TYPE_","")
+      if label~="" and label~="NONE" and label~="NIL" then
+        local duplicate=false
+        for _,existing in ipairs(out) do if existing==label then duplicate=true break end end
+        if not duplicate then out[#out+1]=label end
+        if #out>=2 then break end
+      end
+    end
+  end
+  return out
+end
+
+local function colosseumTypeChipMetrics(label,maxW,h,u)
+  if not label or maxW<=10*u then return nil end
+  label=tostring(label):upper()
+  local desired=8.5*u
+  local size=fitUiTextSize(label,desired,math.max(8*u,maxW-8*u),h-2*u,5*u)
+  local f=font(size)
+  local textW=f:getWidth(label)
+  local chipW=math.min(maxW,textW+10*u)
+  if chipW<=8*u then return nil end
+  return {
+    label=label,
+    size=size,
+    font=f,
+    textW=textW,
+    chipW=chipW,
+    rgb=COLOSSEUM_TYPE_COLORS[label] or {0.38,0.50,0.47},
+  }
+end
+
+local function drawColosseumTypeChip(label,x,y,maxW,h,u,metrics)
+  local m=metrics or colosseumTypeChipMetrics(label,maxW,h,u)
+  if not m then return 0 end
+  local G=love.graphics
+  G.push("all")
+  G.setColor(m.rgb[1]*0.46,m.rgb[2]*0.46,m.rgb[3]*0.46,0.98)
+  G.rectangle("fill",x,y,m.chipW,h,3*u,3*u)
+  G.setColor(m.rgb[1],m.rgb[2],m.rgb[3],0.95)
+  G.setLineWidth(math.max(1,0.7*u))
+  G.rectangle("line",x,y,m.chipW,h,3*u,3*u)
+  G.pop()
+  local textH=m.font:getHeight()
+  text(m.label,x+(m.chipW-m.textW)*0.5,y+math.max(0,(h-textH)*0.5),m.size,
+    {0.96,0.98,0.94,1})
+  return m.chipW
+end
+
 local function drawStatusCard(game,battle,b,side)
   if not b then return end
 
@@ -1074,21 +1241,15 @@ local function drawStatusCard(game,battle,b,side)
   local mobile=mobileBattleUIEnabled()
 
   -- Colosseum reference proportions: long shallow status bar + square portrait
-  -- attached to the OUTER edge. Desktop keeps the established geometry. Mobile
-  -- is allowed to compress the cards to the viewport and, only when a display
-  -- is too narrow for two readable cards, stagger them into two top rows.
-  -- User-adjustable HUD geometry. These settings intentionally affect only
-  -- the Pokémon status assemblies; command/move/dialogue geometry is separate.
-  -- Gen II's tuned NORMAL is slightly tighter than Gen I because its native
-  -- battle sprites sit higher in the field and were brushing the status plate.
-  local widthMode,heightMode,portraitMode="normal","normal","normal"
-  pcall(function()
-    if modRef and modRef.options and modRef.options.get then
-      widthMode=tostring(modRef.options:get("battleHudWidth") or "normal")
-      heightMode=tostring(modRef.options:get("battleHudHeight") or "normal")
-      portraitMode=tostring(modRef.options:get("battleHudPortrait") or "normal")
-    end
-  end)
+  -- attached to the OUTER edge. Font/profile choices may reflow or shrink text
+  -- inside this silhouette, but must never grow the plate itself.
+  local readOption=GoldCompat and GoldCompat.optionValue
+  local widthMode=type(readOption)=="function"
+    and tostring(readOption("battleHudWidth") or "normal") or "normal"
+  local heightMode=type(readOption)=="function"
+    and tostring(readOption("battleHudHeight") or "normal") or "normal"
+  local portraitMode=type(readOption)=="function"
+    and tostring(readOption("battleHudPortrait") or "normal") or "normal"
   local widthMul=(widthMode=="compact" and 0.80)
     or (widthMode=="wide" and 1.10)
     or (widthMode=="x-wide" and 1.20) or 1.00
@@ -1111,14 +1272,11 @@ local function drawStatusCard(game,battle,b,side)
   local margin=34*u
   local y=24*u
   local mobileStacked=false
+  local expH=16*u
 
   if mobile then
     margin=clamp(sw*0.024,12,30)
     gap=clamp(4*u,3,7)
-
-    -- Reserve a real center gutter before deciding the card width.  This makes
-    -- the two HUD assemblies mathematically incapable of crossing each other
-    -- on phone aspect ratios rather than relying on one reference resolution.
     local centerGutter=clamp(14*u,9,20)
     local maxSideCard=(sw-margin*2-portrait*2-gap*2-centerGutter)/2
     local minimumReadable=clamp(250*u,190,310)
@@ -1132,8 +1290,7 @@ local function drawStatusCard(game,battle,b,side)
 
     y=margin
     if mobileStacked and side=="enemy" then
-      -- Leave room for the player's detached EXP rail before the second card.
-      y=y+cardH+clamp(27*u,20,38)
+      y=y+cardH+math.max(clamp(27*u,20,38),expH+8*u)
     end
   end
 
@@ -1145,98 +1302,185 @@ local function drawStatusCard(game,battle,b,side)
     cardX=sw-margin-cardW
     podX=cardX-portrait-gap
   end
-  -- The pod matches the status plate height exactly.
   local podY=y
 
   statusPlateShape(cardX,y,cardW,cardH,side,u)
 
-  -- Battle portraits are independently cosmetic. Disabling this option removes
-  -- the entire pod/badge without changing the HP/status plate geometry or the
-  -- portrait/icon behavior used anywhere outside the battle HUD.
   local showBattlePortraits=true
-  pcall(function()
-    if modRef and modRef.options and modRef.options.get then
-      showBattlePortraits=(modRef.options:get("battlePortraits") ~= false)
-    end
-  end)
-  if showBattlePortraits then
+  if type(readOption)=="function" then
+    showBattlePortraits=(readOption("battlePortraits") ~= false)
+  end
+  local portraitBattlerVisible=shownHP(b)>0 and not b.fainted
+  if showBattlePortraits and portraitBattlerVisible then
     portraitPod(podX,podY,portrait,u)
-
-    -- Pull the artwork back just enough to expose a firm 3u plated edge.
     local portraitPad=3*u
     local px=podX+portraitPad
     local py=podY+portraitPad
     local pw=portrait-portraitPad*2
     local ph=portrait-portraitPad*2
-
     local stadiumDrawn,stadiumOwns=drawStadiumPortrait(game,b.mon,px,py,pw,ph)
     if not stadiumDrawn and not stadiumOwns then
       drawSpritePortrait(game,b.mon,px,py,pw,ph)
     end
-
-    -- Critical ordering: artwork first, visible bevel/keyline last.
     portraitPodOverlay(podX,podY,portrait,u)
   end
 
   local textLeft=cardX+18*u
   local textRight=cardX+cardW-18*u
-  local name=displayName(b)
-  local level=(b.mon and b.mon.level) or "?"
+  local name=tostring(displayName(b) or "")
+  local levelText="Lv "..tostring((b.mon and b.mon.level) or "?")
+  local gender=(b and b.gender) or (b and b.mon and b.mon.gender)
+  local hasGender=(gender=="male" or gender=="female")
 
-  text(name,textLeft,y+7*u*heightMul,18*u*clamp(heightMul,0.88,1.08),{0.94,0.94,0.86,1})
-  do
-    local gender=(b and b.gender) or (b and b.mon and b.mon.gender)
-    if gender=="male" or gender=="female" then
-      local nameW=font(18*u*clamp(heightMul,0.88,1.08)):getWidth(tostring(name or ""))
-      drawColosseumGenderGlyph(math.min(textLeft+nameW+5*u,textLeft+218*u),
-        y+10*u*heightMul,11*u*clamp(heightMul,0.90,1.08),gender)
-    end
+  -- Fixed header zone. Alternate fonts fit themselves to this space instead of
+  -- pushing the HP row downward.
+  local headerTop=y+5*u*heightMul
+  local headerBottom=y+29*u*heightMul
+  local headerH=math.max(8*u,headerBottom-headerTop)
+  local desiredLevelSize=16*u*clamp(heightMul,0.88,1.08)
+  local levelSize=fitUiTextSize(levelText,desiredLevelSize,104*u,headerH,8*u)
+  local levelFont=font(levelSize)
+  local levelW=levelFont:getWidth(levelText)
+  local genderSize=11*u*clamp(heightMul,0.90,1.08)
+  local genderReserve=hasGender and (genderSize+7*u) or 0
+  local maxNameW=math.max(36*u,textRight-textLeft-levelW-genderReserve-12*u)
+  local desiredNameSize=18*u*clamp(heightMul,0.88,1.08)
+  local nameSize=fitUiTextSize(name,desiredNameSize,maxNameW,headerH,8*u)
+  local nameFont=font(nameSize)
+  local nameW=nameFont:getWidth(name)
+  local nameH=nameFont:getHeight()
+  local levelH=levelFont:getHeight()
+  local nameY=headerTop+math.max(0,(headerH-nameH)*0.5)
+  local levelY=headerTop+math.max(0,(headerH-levelH)*0.5)
+
+  text(name,textLeft,nameY,nameSize,{0.94,0.94,0.86,1})
+  if hasGender then
+    local genderX=math.min(textLeft+nameW+5*u,
+      textRight-levelW-genderSize-6*u)
+    local genderY=headerTop+math.max(0,(headerH-genderSize)*0.5)
+    drawColosseumGenderGlyph(genderX,genderY,genderSize,gender)
   end
-  text("Lv "..tostring(level),textRight-104*u,y+7*u*heightMul,16*u*clamp(heightMul,0.88,1.08),
-       {0.94,0.94,0.86,1},"right",104*u)
+  text(levelText,textRight-levelW,levelY,levelSize,{0.94,0.94,0.86,1})
 
-  text("HP",textLeft,y+33*u*heightMul,12*u*clamp(heightMul,0.90,1.08),{0.84,0.75,0.40,1})
-  hpBar(textLeft+34*u,y+35*u*heightMul,cardW-68*u,11*u*clamp(heightMul,0.86,1.08),b,u)
+  -- The HP rail keeps the original Colosseum vertical anchor: immediately below
+  -- the name row, with a dedicated detail band underneath for status/numbers.
+  local desiredHpLabelSize=12*u*clamp(heightMul,0.90,1.08)
+  local hpBandTop=y+31*u*heightMul
+  local hpBandH=17*u*heightMul
+  local hpLabelSize=fitUiTextSize("HP",desiredHpLabelSize,30*u,hpBandH,6*u)
+  local hpLabelFont=font(hpLabelSize)
+  local hpLabelW=hpLabelFont:getWidth("HP")
+  local hpLabelH=hpLabelFont:getHeight()
+  local hpBarH=11*u*clamp(heightMul,0.86,1.08)
+  local hpBarY=y+35*u*heightMul
+  local hpLabelY=hpBandTop+math.max(0,(hpBandH-hpLabelH)*0.5)
+  text("HP",textLeft,hpLabelY,hpLabelSize,{0.84,0.75,0.40,1})
+
+  local caughtWild=(side=="enemy") and colosseumSpeciesCaught(game,battle,b)
+  local caughtReserve=caughtWild and 18*u or 0
+  local hpBarX=math.max(textLeft+34*u,textLeft+hpLabelW+7*u)
+  local hpBarRight=textRight-caughtReserve
+  hpBar(hpBarX,hpBarY,math.max(36*u,hpBarRight-hpBarX),hpBarH,b,u)
+  if caughtWild then
+    drawColosseumCaughtBall(textRight-5*u,hpBarY+hpBarH*0.5,5.2*u)
+  end
+
+  -- Fixed lower detail band. Numerical HP is always bottom-right INSIDE the
+  -- status plate; font size is reduced only when its measured bounds require it.
+  local detailTop=y+51*u*heightMul
+  local detailBottom=y+cardH-5*u
+  local detailH=math.max(7*u,detailBottom-detailTop)
+  local hpReadout=("%d / %d"):format(shownHP(b),maxHP(b))
+  local desiredDetailSize=11*u*clamp(heightMul,0.90,1.08)
+  local readoutSize=fitUiTextSize(hpReadout,desiredDetailSize,122*u,detailH,5.5*u)
+  local readoutFont=font(readoutSize)
+  local hpReadoutW=readoutFont:getWidth(hpReadout)
+  local readoutH=readoutFont:getHeight()
+  local detailY=detailTop+math.max(0,(detailH-readoutH)*0.5)
 
   local st=statusText(b)
-  if st then
-    text(st,textLeft,y+54*u*heightMul,11*u*clamp(heightMul,0.90,1.08),{0.95,0.76,0.28,1})
+  local detailRight=math.max(textLeft,textRight-hpReadoutW-10*u)
+  local detailWidth=math.max(0,detailRight-textLeft)
+
+  -- Both battler cards expose the same compact live-type readout. Keep the
+  -- complete chip group visually centred inside the lower detail lane instead
+  -- of pinning it to the left edge. A status condition, when present, receives
+  -- a small left-side reservation first; the type group is then centred in the
+  -- remaining lane so neither single- nor dual-type labels look lopsided.
+  local typeNames=colosseumBattlerTypeNames(game,b)
+  local chipH=math.max(7*u,math.min(detailH,12*u*clamp(heightMul,0.90,1.08)))
+  local chipY=detailTop+math.max(0,(detailH-chipH)*0.5)
+
+  local statusReserve=0
+  local statusSize,statusW,statusY=nil,nil,nil
+  if st and detailWidth>=22*u then
+    statusSize=fitUiTextSize(st,desiredDetailSize,math.min(54*u,detailWidth),detailH,5.5*u)
+    local sf=font(statusSize)
+    statusW=sf:getWidth(st)
+    statusY=detailTop+math.max(0,(detailH-sf:getHeight())*0.5)
+    statusReserve=math.min(detailWidth,statusW+8*u)
   end
 
-  text(("%d / %d"):format(shownHP(b),maxHP(b)),
-       textRight-122*u,y+52*u*heightMul,11*u*clamp(heightMul,0.90,1.08),
-       {0.80,0.82,0.75,1},"right",122*u)
+  local typeAreaLeft=textLeft+statusReserve
+  local typeAreaW=math.max(0,detailRight-typeAreaLeft)
+  local typeMetrics={}
+  local chipGap=4*u
+  local typeCount=math.min(2,#typeNames)
+  if typeCount>0 and typeAreaW>18*u then
+    local perChipMax=math.min(58*u,
+      math.max(12*u,(typeAreaW-chipGap*math.max(0,typeCount-1))/typeCount))
+    local groupW=0
+    for i=1,typeCount do
+      local m=colosseumTypeChipMetrics(typeNames[i],perChipMax,chipH,u)
+      if m then
+        typeMetrics[#typeMetrics+1]=m
+        groupW=groupW+m.chipW
+      end
+    end
+    if #typeMetrics>1 then groupW=groupW+chipGap*(#typeMetrics-1) end
+    local typeX=typeAreaLeft+math.max(0,(typeAreaW-groupW)*0.5)
+    for i,m in ipairs(typeMetrics) do
+      drawColosseumTypeChip(m.label,typeX,chipY,m.chipW,chipH,u,m)
+      typeX=typeX+m.chipW+(i<#typeMetrics and chipGap or 0)
+    end
+  end
+
+  if st and statusSize and statusW and statusY then
+    text(st,textLeft,statusY,statusSize,{0.95,0.76,0.28,1})
+  end
+  text(hpReadout,textRight-hpReadoutW,detailY,readoutSize,{0.80,0.82,0.75,1})
 
   if side=="player" then
-    -- Detached EXP banner: narrower than the HP plate and hanging slightly
-    -- below it, echoing the layered status-box construction of older Pokémon UIs.
     local expX=cardX+18*u
     local expY=y+cardH-2*u
     local expW=cardW-54*u
-    local expH=16*u
 
     love.graphics.setColor(0.055,0.070,0.068,0.97)
     love.graphics.rectangle("fill",expX,expY,expW,expH)
-
-    -- Small left-pointing notch gives the banner a distinct silhouette instead
-    -- of reading as another row inside the HP panel.
     love.graphics.polygon("fill",
       expX-8*u,expY,
       expX,expY,
       expX,expY+expH,
       expX-5*u,expY+expH-4*u
     )
-
     love.graphics.setColor(0.23,0.26,0.24,1)
     love.graphics.setLineWidth(math.max(1,0.8*u))
     love.graphics.line(expX,expY,expX+expW,expY)
     love.graphics.line(expX,expY+expH,expX+expW-5*u,expY+expH)
 
-    text("EXP",expX+8*u,expY+3*u,8*u,{0.52,0.69,0.92,1})
-    expBar(game,b,expX+34*u,expY+5*u,expW-44*u,5*u,u)
+    local expDesired=8*u
+    local expSize=fitUiTextSize("EXP",expDesired,30*u,expH-3*u,4*u)
+    local expFont=font(expSize)
+    local expLabelW=expFont:getWidth("EXP")
+    local expLabelY=expY+math.max(1*u,(expH-expFont:getHeight())*0.5)
+    text("EXP",expX+8*u,expLabelY,expSize,{0.52,0.69,0.92,1})
+    local expBarX=expX+8*u+expLabelW+8*u
+    local expBarH=5*u
+    local expBarY=expY+(expH-expBarH)*0.5
+    local expBarW=math.max(18*u,expX+expW-10*u-expBarX)
+    expBar(game,b,expBarX,expBarY,expBarW,expBarH,u)
   end
 
-  -- Party Poké Balls sit just above the plate like the GameCube HUD.
   local partyX
   if side=="player" then
     partyX=cardX+20*u
@@ -1330,15 +1574,28 @@ local function drawCommandMenu(battle)
     local y=r.y+padY+row*cellH
     local selected=battle.menuIndex==i
 
+    local labelSize=17*u
+    local labelFont=font(labelSize)
+    local labelH=labelFont and labelFont:getHeight() or labelSize
+    local baseLabelY=y+cellH*0.18
+    local labelY=clamp(baseLabelY,y+2*u,y+math.max(2*u,cellH-labelH-2*u))
+
     if selected then
       love.graphics.setColor(0.33,0.35,0.32,0.80)
       love.graphics.polygon("fill",
         x+8*u,y+2*u,x+cellW-5*u,y+2*u,
         x+cellW,y+cellH-2*u,x+8*u,y+cellH-2*u)
-      selector(x-4*u,y,cellH,u)
+
+      -- The selector follows the actual text row, not a hard-coded cell center.
+      -- This keeps it visually attached to FIGHT/POKéMON/BAG/RUN at every
+      -- supported text profile/size without resizing the command panel.
+      local indicatorH=clamp(labelH*0.62,8*u,cellH*0.48)
+      local indicatorY=clamp(labelY+(labelH-indicatorH)*0.5,
+        y+2*u,y+cellH-indicatorH-2*u)
+      selector(x-4*u,indicatorY,indicatorH,u)
     end
 
-    text(label,x+14*u,y+cellH*0.18,17*u,
+    text(label,x+14*u,labelY,labelSize,
       selected and {0.97,0.94,0.76,1} or {0.76,0.79,0.72,1})
   end
 end
@@ -1453,23 +1710,31 @@ local function drawMoveMenu(battle)
     local cy=top+row*cellH
     local selected=battle.moveIndex==i
 
+    local moveNameSize=14*u
+    local moveNameFont=font(moveNameSize)
+    local moveNameH=moveNameFont and moveNameFont:getHeight() or moveNameSize
+    local moveNameY=clamp(cy+4*u,cy+2*u,cy+math.max(2*u,cellH-moveNameH-2*u))
+
     if selected then
       love.graphics.setColor(0.32,0.34,0.31,0.82)
       love.graphics.polygon("fill",
         cx+7*u,cy+2*u,cx+cellW-5*u,cy+2*u,
         cx+cellW,cy+cellH-3*u,cx+7*u,cy+cellH-3*u)
-      selector(cx-4*u,cy,cellH,u)
+      local indicatorH=clamp(moveNameH*0.62,8*u,cellH*0.46)
+      local indicatorY=clamp(moveNameY+(moveNameH-indicatorH)*0.5,
+        cy+2*u,cy+cellH-indicatorH-2*u)
+      selector(cx-4*u,indicatorY,indicatorH,u)
     end
 
     if mv then
       local pp,maxpp=movePP(battle,mv)
-      text(moveName(battle,mv),cx+14*u,cy+4*u,14*u,
+      text(moveName(battle,mv),cx+14*u,moveNameY,moveNameSize,
         selected and {0.98,0.94,0.73,1} or {0.79,0.81,0.74,1})
       text(moveType(battle,mv),cx+14*u,cy+24*u,10*u,{0.52,0.55,0.50,1})
       text(("PP %d/%d"):format(pp,maxpp),
         cx+cellW-101*u,cy+23*u,10*u,{0.63,0.65,0.59,1},"right",91*u)
     else
-      text("—",cx+14*u,cy+9*u,14*u,{0.46,0.48,0.44,1})
+      text("—",cx+14*u,moveNameY,moveNameSize,{0.46,0.48,0.44,1})
     end
   end
 end
@@ -1515,83 +1780,228 @@ local function messageLinesForBattle(battle)
   return out
 end
 
-local function drawConsoleMessageLines(lines,waiting,frame)
+local function drawConsoleMessageLines(lines,waiting,frame,sourceLines)
   if type(lines)~="table" or #lines==0 then return false end
+  sourceLines=type(sourceLines)=="table" and sourceLines or lines
+
   local sw,sh=love.graphics.getDimensions()
-  local u=scaleForWindow()
-  local mobile=false
-  pcall(function()
-    mobile=modRef and modRef.options and modRef.options.get
-      and modRef.options:get("mobileBattleUI")==true or false
-  end)
+  local baseU=scaleForWindow()
+  local boxScale=GoldCompat.userBoxScale()
+  local u=baseU*boxScale
+  local readOption=GoldCompat and GoldCompat.optionValue
+  local mobile=type(readOption)=="function"
+    and readOption("mobileBattleUI")==true or false
   local portrait=sh>sw
 
-  -- Dialogue deliberately occupies the same centered lower-stage footprint as
-  -- the Colosseum move panel. Battle commands disappear while messages own the
-  -- flow, leaving one consistent GameCube-style conversation surface.
-  local hasSecond=lines[2] and tostring(lines[2])~=""
-  local lineSize=clamp(16*u,13,26)
-  local lineGap=clamp(27*u,22,42)
-  local mobilePadX=clamp(22*u,16,30)
-  local mobilePadY=clamp(11*u,8,16)
-  local maxLineW=0
+  -- Typography drives the shell, not the other way around. The selected
+  -- profile/size is measured first with the real loaded font. The panel then
+  -- expands to contain those glyphs before any last-resort fitting is allowed.
+  local baseSize=clamp(16*baseU,13,26)
+  local f=font(baseSize)
+  local glyphH=math.max(1,f:getHeight())
+  local lineGap=math.max(glyphH+clamp(4*baseU,3,8),math.ceil(glyphH*1.16))
+
+  local cleanSource={}
+  local cleanDraw={}
+  for i=1,math.min(2,math.max(#sourceLines,#lines)) do
+    cleanSource[i]=tostring(sourceLines[i] or ""):gsub("","")
+    cleanDraw[i]=tostring(lines[i] or ""):gsub("","")
+  end
+  if #cleanSource==0 then cleanSource[1]="" end
+  if #cleanDraw==0 then cleanDraw[1]="" end
+
+  local padX=mobile and clamp(22*u,16,34) or clamp(30*u,22,46)
+  local padY=mobile and clamp(11*u,8,18) or clamp(16*u,11,25)
+  local cursorSpace=clamp(30*u,22,48)
+  local margin=clamp(18*u,12,38)
+  local maxW=math.max(220,sw-margin*2)
   if mobile then
-    local f=font(lineSize)
-    for i=1,math.min(2,#lines) do
-      maxLineW=math.max(maxLineW,f:getWidth(tostring(lines[i] or "")))
+    maxW=math.min(maxW,sw*(portrait and 0.90 or 0.74))
+  else
+    maxW=math.min(maxW,math.max(760,sw*0.84))
+  end
+
+  local maxLineW=0
+  for i=1,math.min(2,#cleanSource) do
+    maxLineW=math.max(maxLineW,GoldCompat.measureFontWidth(f,cleanSource[i]))
+  end
+
+  local standardW=mobile
+      and clamp(sw*(portrait and 0.74 or 0.48),260,720)
+      or clamp(820*u,590,1180)
+  local minW=math.min(maxW,mobile and clamp(280*u,250,420) or clamp(590*u,500,850))
+  local desiredW=math.max(standardW,maxLineW+padX*2+cursorSpace)
+  local w=clamp(desiredW,minW,maxW)
+
+  -- If even the largest safe shell cannot contain an unusually wide custom
+  -- font, only then reduce the point size. Normal profile/size changes should
+  -- therefore grow the dialogue card instead of being squeezed into it.
+  local contentW=math.max(1,w-padX*2-cursorSpace)
+  local drawSize=baseSize
+  while maxLineW>contentW and drawSize>9 do
+    drawSize=drawSize-1
+    f=font(drawSize)
+    glyphH=math.max(1,f:getHeight())
+    lineGap=math.max(glyphH+clamp(4*baseU,3,8),math.ceil(glyphH*1.16))
+    maxLineW=0
+    for i=1,math.min(2,#cleanSource) do
+      maxLineW=math.max(maxLineW,GoldCompat.measureFontWidth(f,cleanSource[i]))
     end
   end
-  local w=mobile
-      and clamp(maxLineW+mobilePadX*2+34*u,
-        250,sw*(portrait and 0.84 or 0.58))
-      or clamp(820*u,590,1180)
-  local textBlockH=hasSecond and (lineGap+lineSize) or lineSize
-  local h=mobile
-      and clamp(textBlockH+mobilePadY*2,48,96)
-      or clamp(108*u,82,165)
-  local x=(sw-w)/2
+
+  local rows=math.max(1,math.min(2,#cleanSource))
+  local blockH=glyphH+math.max(0,rows-1)*lineGap
+  local standardH=mobile and clamp(58*u,50,108) or clamp(108*u,82,170)
+  local maxH=math.max(standardH,sh-margin*2)
+  if mobile then maxH=math.min(maxH,sh*0.30) else maxH=math.min(maxH,sh*0.34) end
+  local h=clamp(math.max(standardH,blockH+padY*2),standardH,maxH)
+
+  local x=(sw-w)*0.5
   local y
   if mobile then
-    -- Dialogue is the anchor for the mobile lower-console lane. Commands and
-    -- moves share this same bottom edge so transitions never jump upward over
-    -- the Pokémon sprites.
-    y=mobileBattleConsoleBottom(sw,sh,u)-h
+    y=mobileBattleConsoleBottom(sw,sh,baseU)-h
   else
-    y=sh-h-22*u
+    y=sh-h-clamp(22*u,14,44)
   end
 
+  love.graphics.push("all")
+  love.graphics.origin()
   consolePanel(x,y,w,h,u)
 
-  local padX=mobile and mobilePadX or 30*u
-  local padY=mobile and mobilePadY or 18*u
-  local contentW=w-padX*2
+  local textY=y+math.max(padY,(h-blockH)*0.5)
   local color={0.88,0.90,0.82,1}
+  local clipX=x+padX-2
+  local clipY=y+math.max(4,padY*0.45)
+  local clipW=math.max(1,w-padX*2-cursorSpace+4)
+  local clipH=math.max(1,h-math.max(8,padY*0.9))
+  love.graphics.setScissor(
+    math.floor(clipX),math.floor(clipY),math.floor(clipW),math.floor(clipH))
 
-  -- Use a maximum of the current two-line battle page, matching native battle
-  -- pacing. Longer source strings remain engine-owned and advance normally.
-  text(tostring(lines[1] or ""),x+padX,y+padY,lineSize,
-    color,"left",contentW)
-  if lines[2] and tostring(lines[2])~="" then
-    text(tostring(lines[2]),x+padX,y+padY+lineGap,lineSize,
+  for i=1,math.min(2,#cleanDraw) do
+    text(cleanDraw[i],x+padX,textY+(i-1)*lineGap,drawSize,
       color,"left",contentW)
   end
+  love.graphics.setScissor()
 
-  -- Match the rest of the mod's battle continue semantics without taking input
-  -- ownership away from either generation.
   if waiting and ((tonumber(frame) or 0)%60)<30 then
     love.graphics.setColor(0.90,0.23,0.13,1)
-    local cx=x+w-34*u
-    local cy=y+h-22*u
-    love.graphics.polygon("fill",
-      cx,cy,cx+12*u,cy,cx+6*u,cy+8*u)
+    local cx=x+w-clamp(28*u,20,42)
+    local cy=y+h-clamp(19*u,14,30)
+    love.graphics.polygon("fill",cx,cy,cx+10*u,cy,cx+5*u,cy+7*u)
   end
-  -- render.hud runs after Gen I has finished compositing the frame. Unlike the
-  -- battle renderer, the overworld dialogue caller does not surround this
-  -- shared helper with push("all")/pop(). Leaving the continuation cursor's
-  -- red color active therefore tinted the NEXT frame's world canvas red. The
-  -- TextBox blink counter advances on the logic clock, so 4x speed turned that
-  -- leaked state into the rapid full-screen red strobe seen in captures.
   love.graphics.setColor(1,1,1,1)
+  love.graphics.pop()
+  return true
+end
+
+-- Gen 2 overworld dialogue uses the exact same proven console renderer path as
+-- battle dialogue, but with content-sized geometry. Do not create a second
+-- framebuffer/final-pass implementation here: the shared TextBox draw hook
+-- already suppresses the native box, so any exception in a replacement path
+-- would make dialogue disappear completely. This helper only changes layout.
+function GoldCompat.drawCompactGen2DialogueStable(lines,sourceLines,waiting,frame)
+  if type(lines)~="table" or #lines==0 then return false end
+  sourceLines=type(sourceLines)=="table" and sourceLines or lines
+
+  local g=love.graphics
+  local sw,sh=g.getDimensions()
+  local baseU=scaleForWindow()
+  local boxScale=GoldCompat.userBoxScale()
+  local u=baseU*boxScale
+  local baseSize=clamp(15*baseU,12,24)
+  local f=font(baseSize)
+  local glyphH=math.max(1,f:getHeight())
+  local padX=clamp(22*u,16,38)
+  local padY=clamp(11*u,8,22)
+  local cursorSpace=clamp(30*u,22,48)
+  local margin=clamp(18*u,12,40)
+  local maxW=math.min(sw-margin*2,math.max(460,sw*0.86))
+  local minW=math.min(maxW,clamp(280*u,250,430))
+
+  local full1=tostring(sourceLines[1] or ""):gsub("","")
+  local full2=tostring(sourceLines[2] or ""):gsub("","")
+  local fullCombined=full1
+  if full2~="" then fullCombined=(full1.." "..full2):gsub("%s+"," ") end
+
+  -- Gold supplies native 18-column source rows. Reflow them according to the
+  -- ACTUAL equipped font, not a fixed character count. A wider or larger font
+  -- grows the card first; a narrow font can collapse the two Gold rows into
+  -- one clean modern line.
+  local maximumContent=math.max(1,maxW-padX*2-cursorSpace)
+  local joinRows=full2~="" and GoldCompat.measureFontWidth(f,fullCombined)<=maximumContent
+  local layoutSource={}
+  local layoutDraw={}
+  if joinRows then
+    layoutSource[1]=fullCombined
+    local a=tostring(lines[1] or ""):gsub("","")
+    local b=tostring(lines[2] or ""):gsub("","")
+    layoutDraw[1]=(b~="" and (a.." "..b) or a):gsub("%s+"," ")
+  else
+    layoutSource[1]=full1
+    layoutDraw[1]=tostring(lines[1] or ""):gsub("","")
+    if full2~="" then
+      layoutSource[2]=full2
+      layoutDraw[2]=tostring(lines[2] or ""):gsub("","")
+    end
+  end
+
+  local drawSize=baseSize
+  local maxLineW=0
+  for i=1,math.min(2,#layoutSource) do
+    maxLineW=math.max(maxLineW,GoldCompat.measureFontWidth(f,layoutSource[i]))
+  end
+
+  local standardW=clamp(390*u,300,680)
+  local desiredW=math.max(standardW,maxLineW+padX*2+cursorSpace)
+  local w=clamp(desiredW,minW,maxW)
+  local contentW=math.max(1,w-padX*2-cursorSpace)
+
+  -- Screen bounds are the only reason to reduce the configured text. This is
+  -- an emergency fallback for pathological fonts, not the normal layout path.
+  while maxLineW>contentW and drawSize>9 do
+    drawSize=drawSize-1
+    f=font(drawSize)
+    glyphH=math.max(1,f:getHeight())
+    maxLineW=0
+    for i=1,math.min(2,#layoutSource) do
+      maxLineW=math.max(maxLineW,GoldCompat.measureFontWidth(f,layoutSource[i]))
+    end
+  end
+
+  local lineGap=math.max(glyphH+clamp(4*baseU,3,8),math.ceil(glyphH*1.16))
+  local rows=math.max(1,math.min(2,#layoutSource))
+  local textBlockH=glyphH+math.max(0,rows-1)*lineGap
+  local minH=clamp(54*u,48,84)
+  local maxH=math.min(sh-margin*2,math.max(minH,sh*0.30))
+  local h=clamp(math.max(minH,textBlockH+padY*2),minH,maxH)
+  local x=(sw-w)*0.5
+  local y=sh-h-clamp(18*u,13,34)
+
+  g.push("all")
+  g.origin()
+  consolePanel(x,y,w,h,u)
+
+  local color={0.88,0.90,0.82,1}
+  local textY=y+math.max(padY,(h-textBlockH)*0.5)
+  g.setScissor(
+    math.floor(x+padX-2),
+    math.floor(y+math.max(4,padY*0.45)),
+    math.floor(math.max(1,contentW+4)),
+    math.floor(math.max(1,h-math.max(8,padY*0.9)))
+  )
+  for i=1,math.min(2,#layoutDraw) do
+    text(layoutDraw[i],x+padX,textY+(i-1)*lineGap,drawSize,
+      color,"left",contentW)
+  end
+  g.setScissor()
+
+  if waiting and ((tonumber(frame) or 0)%60)<30 then
+    g.setColor(0.90,0.23,0.13,1)
+    local cx=x+w-clamp(28*u,20,42)
+    local cy=y+h-clamp(19*u,14,30)
+    g.polygon("fill",cx,cy,cx+10*u,cy,cx+5*u,cy+7*u)
+  end
+  g.pop()
   return true
 end
 
@@ -1730,8 +2140,8 @@ function ColosseumUI.drawPortrait(game,mon,x,y,w,h)
   return drawStadiumPortrait(game,mon,x,y,w,h)
 end
 
-function ColosseumUI.drawDialogue(lines,waiting,frame)
-  return drawConsoleMessageLines(lines,waiting,frame)
+function ColosseumUI.drawDialogue(lines,waiting,frame,sourceLines)
+  return drawConsoleMessageLines(lines,waiting,frame,sourceLines)
 end
 
 function ColosseumUI.supported(battle)
@@ -1844,6 +2254,7 @@ function GoldCompat.presentBattleState(state)
     party=core.party,
     playerParty=core.party or state.playerParty,
     enemyParty=core.enemyParty or state.enemyParty,
+    wild=core.wild==true,
     phase=phase,
     menuIndex=state.menuIndex or 1,
     moveIndex=(state.phase=="choose-forget" and state.forgetIndex)
@@ -1933,58 +2344,138 @@ local spritePortraitResolver = (function()
   local R = {
     mod = nil,
     cache = {},
+    cacheAge = {},
+    cacheClock = 0,
+    cacheLimit = 96,
     ba = nil,
     baV = nil,
     baSets = {},
+    settingCache = setmetatable({}, {__mode="k"}),
   }
 
-  local function settingValue(setting)
-    if setting and type(setting.get) == "function" then
-      local ok, value = pcall(setting.get, setting)
-      if ok then return value end
+  -- Information surfaces can traverse hundreds of species in one session.
+  -- Keep a bounded provider-image LRU so Battle Arts/custom sprite decoding is
+  -- paid once for the working set without pinning every visited image forever.
+  -- We only drop our reference on eviction: engine/third-party asset managers
+  -- remain owners of any shared Image objects they returned.
+  local function cacheGet(key)
+    local value=R.cache[key]
+    if value~=nil then
+      R.cacheClock=R.cacheClock+1
+      R.cacheAge[key]=R.cacheClock
     end
-    return nil
+    return value
   end
+
+  local function cachePut(key,value)
+    R.cacheClock=R.cacheClock+1
+    R.cache[key]=value
+    R.cacheAge[key]=R.cacheClock
+    local count=0
+    for _ in pairs(R.cache) do count=count+1 end
+    while count>R.cacheLimit do
+      local oldestKey,oldestAge=nil,math.huge
+      for k,age in pairs(R.cacheAge) do
+        if age<oldestAge then oldestKey,oldestAge=k,age end
+      end
+      if not oldestKey then break end
+      R.cache[oldestKey]=nil;R.cacheAge[oldestKey]=nil;count=count-1
+    end
+    return value
+  end
+
+  local function settingValue(setting)
+    if not (setting and type(setting.get) == "function") then return nil end
+    local epoch=GoldCompat.__presentationProviderEpoch or 0
+    local cached=R.settingCache[setting]
+    if cached and cached.epoch==epoch then return cached.value end
+    local ok, value = pcall(setting.get, setting)
+    value=ok and value or nil
+    R.settingCache[setting]={epoch=epoch,value=value}
+    return value
+  end
+
+  local function battleArtsDisplayMode(BA)
+    local epoch=GoldCompat.__presentationProviderEpoch or 0
+    if R.displayModeEpoch==epoch and R.displayModeValue~=nil then
+      return R.displayModeValue
+    end
+    local displayMode="default"
+    if BA and type(BA.displayMode)=="function" then
+      local okMode,value=pcall(BA.displayMode)
+      if okMode and value then displayMode=tostring(value) end
+    end
+    R.displayModeEpoch=epoch
+    R.displayModeValue=displayMode
+    return displayMode
+  end
+
+  -- Battle Art changed package IDs as the cross-generation/Gen 2 branch
+  -- matured. Keep one compatibility list here so Party/Summary/Pokédex use
+  -- the exact same selected art that CBE uses in battle instead of silently
+  -- dropping to ROM sprites when the current package is installed.
+  local BATTLE_ART_IDS = {
+    "BATTLE_ART_VOXEL_GEN2",
+    "BATTLE_ART_VOXEL_FORK",
+    "DRAMATIC_SHAPE",
+  }
 
   local function connectBattleArts()
     if R.ba and R.baV then return R.ba, R.baV end
+    local epoch=GoldCompat.__presentationProviderEpoch or 0
+    if R.baCheckedEpoch==epoch then return nil end
+    R.baCheckedEpoch=epoch
+
     local mod = R.mod
     if not (mod and mod.find) then return nil end
 
-    local okHandle, handle = pcall(mod.find, "BATTLE_ART_VOXEL_FORK")
-    if not (okHandle and handle and type(handle.exports) == "table") then
-      return nil
+    local handle,foundId
+    for _,id in ipairs(BATTLE_ART_IDS) do
+      local okHandle,value=pcall(mod.find,id)
+      if not okHandle then okHandle,value=pcall(mod.find,mod,id) end
+      if okHandle and value and type(value.exports)=="table" then
+        handle,foundId=value,id
+        break
+      end
     end
+    if not handle then return nil end
 
     local V = handle.exports.lib
-    if type(V) ~= "table" or type(V.require) ~= "function" then return nil end
+    local BA = handle.exports.battleArt
+    if type(BA) ~= "table" and type(V)=="table" and type(V.require)=="function" then
+      local okBA,value = pcall(V.require, "BattleArt")
+      if okBA and type(value)=="table" then BA=value end
+    end
+    if type(BA) ~= "table" then return nil end
+    -- The current 2.0.9 animated collections still expose their atlas/data
+    -- helpers through exports.lib. Without that helper STATIC can still be
+    -- consumed, while ANIMATED safely falls through to the engine resolver.
+    if type(V) ~= "table" then V={} end
 
-    local okBA, BA = pcall(V.require, "BattleArt")
-    if not (okBA and type(BA) == "table") then return nil end
-
-    R.ba, R.baV = BA, V
+    R.ba, R.baV, R.baId = BA, V, foundId
     return BA, V
   end
 
-  local function battleArtsSet(V, generation)
-    local cached = R.baSets[generation]
+  local function battleArtsSet(V, generation, shiny)
+    local setKey=tostring(generation)..(shiny and ":shiny" or ":normal")
+    local cached = R.baSets[setKey]
     if cached ~= nil then return cached or nil end
     if type(V.data) ~= "function" then
-      R.baSets[generation] = false
+      R.baSets[setKey] = false
       return nil
     end
-    local ok, data = pcall(V.data, "animated_battle_sprites_" .. generation)
-    R.baSets[generation] = (ok and data) or false
+    local dataName="animated_battle_sprites_"..tostring(generation)
+      ..(shiny and "_shiny" or "")
+    local ok, data = pcall(V.data, dataName)
+    -- A collection is allowed to omit a dedicated shiny atlas. In that case
+    -- the caller may still fall back to its regular image or another provider.
+    R.baSets[setKey] = (ok and data) or false
     return ok and data or nil
   end
 
   local function prepareBattleArtsFrame(BA, data)
     if type(BA.prepareData) == "function" then
-      local displayMode = "default"
-      if type(BA.displayMode) == "function" then
-        local okMode, mode = pcall(BA.displayMode)
-        if okMode and mode then displayMode = mode end
-      end
+      local displayMode=battleArtsDisplayMode(BA)
       local ok, image = pcall(BA.prepareData, data, displayMode)
       if ok and image then return image end
     end
@@ -2008,14 +2499,26 @@ local spritePortraitResolver = (function()
     return okData and data or nil
   end
 
-  local function battleArtsAnimatedFrame(BA, V, species, generation)
-    local set = battleArtsSet(V, generation)
-    local def = set and set[tostring(species or ""):upper()]
+  local function battleArtsAnimatedFrame(BA, V, species, generation, mon)
+    local alias=species
+    if BA and type(BA.speciesAlias)=="function" then
+      local ok,value=pcall(BA.speciesAlias,species)
+      if ok and value~=nil then alias=value end
+    end
+    local shiny=false
+    if BA and type(BA.isShiny)=="function" then
+      local ok,value=pcall(BA.isShiny,mon)
+      shiny=ok and value==true or false
+    end
+    local set = battleArtsSet(V, generation, shiny)
+    local def = set and set[tostring(alias or ""):upper()]
     def = def and def.front
     if not (def and def.image) then return nil end
 
-    local key = "ba:read:" .. tostring(generation) .. ":" .. tostring(species)
-    local cached = R.cache[key]
+    local displayMode=battleArtsDisplayMode(BA)
+    local key = "ba:read:" .. tostring(displayMode) .. ":" .. tostring(generation)
+      .. ":" .. (shiny and "shiny:" or "normal:") .. tostring(alias)
+    local cached = cacheGet(key)
     if cached ~= nil then
       return cached or nil
     end
@@ -2056,18 +2559,38 @@ local spritePortraitResolver = (function()
       image = prepareBattleArtsFrame(BA, frame)
     end)
 
-    R.cache[key] = (ok and image) or false
+    cachePut(key,(ok and image) or false)
     return ok and image or nil
   end
 
   local function battleArtsPortrait(mon)
     local BA, V = connectBattleArts()
-    if not (BA and V and mon and mon.species) then return nil end
+    if not (BA and mon and mon.species) then return nil end
 
     local mode = settingValue(BA.setting)
     if mode == "rom" then return nil end
 
-    local species = mon.species
+    -- Current Battle Art contract: DUPLICATE FIX = MODDED yields species-art
+    -- ownership completely. Do not cherry-pick a Battle Art shiny or static
+    -- image after it yielded; the next pokemon.sprite provider (Crystal, a
+    -- personal pack, etc.) must get first refusal exactly as it does in battle.
+    local owns=true
+    if type(BA.ownsSpeciesArt)=="function" then
+      local ok,value=pcall(BA.ownsSpeciesArt)
+      if ok then owns=value~=false end
+    elseif type(BA.prefersModded)=="function" then
+      local ok,value=pcall(BA.prefersModded)
+      if ok and value then owns=false end
+    end
+    if not owns then return nil end
+
+    local species=mon.species
+    local alias=species
+    if type(BA.speciesAlias)=="function" then
+      local ok,value=pcall(BA.speciesAlias,species)
+      if ok and value~=nil then alias=value end
+    end
+
     local function slug(value)
       local name = tostring(value or ""):lower()
       name = name:gsub("♀", "-f"):gsub("♂", "-m")
@@ -2075,49 +2598,52 @@ local spritePortraitResolver = (function()
       name = name:gsub("[^%w]+", "-"):gsub("^-+", ""):gsub("-+$", "")
       return name
     end
-    local name = slug(species)
+    local name = slug(alias)
 
     local function preparedRelative(relative)
-      local key = "ba:file:" .. relative
-      local cached = R.cache[key]
+      local displayMode=battleArtsDisplayMode(BA)
+      local key = "ba:file:" .. tostring(displayMode) .. ":" .. relative
+      local cached = cacheGet(key)
       if cached ~= nil then return cached or nil end
       local data = battleArtsImageData(V, relative)
       local image = data and prepareBattleArtsFrame(BA, data) or nil
-      R.cache[key] = image or false
+      cachePut(key,image or false)
       return image
     end
 
-    local generation = settingValue(BA.frontAnimationSetting)
-
-    -- Battle Arts' MODDED mode only owns a picture when its matching shiny
-    -- override exists; otherwise normal pokemon.sprite ownership wins.
-    if type(BA.prefersModded) == "function" then
-      local okModded, modded = pcall(BA.prefersModded)
-      if okModded and modded then
-        if mode == "animated" and tostring(generation or ""):match("^gen[1-5]$") then
-          return preparedRelative(
-            "assets/battle/front-animated/shiny/" .. generation .. "/" .. name .. ".png")
-        elseif mode == "static" then
-          return preparedRelative(
-            "assets/battle/front-static/shiny/" .. name .. ".png")
-        end
-        return nil
-      end
-    end
-
     if mode == "static" then
+      -- Prefer Battle Art's exported image resolver: it already implements
+      -- species aliases, shiny selection, matte removal and display filtering.
+      if type(BA.image)=="function" then
+        local ok,image=pcall(BA.image,species,"front",mon)
+        if ok and image then return image end
+      end
       return preparedRelative("assets/battle/front-static/" .. name .. ".png")
     end
 
     if mode ~= "animated" then return nil end
+    local generation = settingValue(BA.frontAnimationSetting)
     if not tostring(generation or ""):match("^gen[1-5]$") then return nil end
 
-    if generation == "gen1" then
-      return preparedRelative(
-        "assets/battle/front-animated/gen1/" .. name .. ".png")
+    -- Gen 1's animated selector is one image per species, so Battle Art's own
+    -- resolver is exact and shiny-aware. Gen 2-5 can be atlases; use the
+    -- exported metadata table and extract the first authored frame for a stable
+    -- information-surface portrait rather than drawing an entire sheet.
+    if generation == "gen1" and type(BA.generationFrontImage)=="function" then
+      local ok,image=pcall(BA.generationFrontImage,species,generation,mon)
+      if ok and image then return image end
     end
 
-    return battleArtsAnimatedFrame(BA, V, species, generation)
+    local animated=battleArtsAnimatedFrame(BA,V,alias,generation,mon)
+    if animated then return animated end
+
+    -- Legacy Battle Art packages may not export atlas metadata through V.data.
+    -- Only Gen 1 is safe to path-fallback because later generations can be
+    -- multi-frame sheets.
+    if generation=="gen1" then
+      return preparedRelative("assets/battle/front-animated/gen1/" .. name .. ".png")
+    end
+    return nil
   end
 
   local function enginePalette(data, species, mon)
@@ -2125,17 +2651,21 @@ local spritePortraitResolver = (function()
     -- native two-color battle palette. Use the same Gen 2 palette resolver
     -- the battle renderer uses, instead of the Gen 1/SGB mon palette helper.
     if GoldCompat.generation=="gen2" then
-      local okPal,Palettes=pcall(require,"src.world.gen2.Palettes")
+      local Palettes=GoldCompat.__gen2PalettesModule
+      if Palettes==nil then
+        local okPal,value=pcall(require,"src.world.gen2.Palettes")
+        Palettes=(okPal and value) or false
+        GoldCompat.__gen2PalettesModule=Palettes
+      end
       -- IMPORTANT: Gold's Pokémon battle palettes live in game.data.gen2Palettes.
       -- This is the exact table src/ui/gen2/BattleState.lua stores as
       -- self.palettes before calling Palettes.monColors().
       local paletteData=data and data.gen2Palettes
-      local colors=okPal and Palettes
-        and type(Palettes.monColors)=="function"
-        and Palettes.monColors(paletteData,species,mon and mon.shiny)
+      local colors=Palettes and type(Palettes.monColors)=="function"
+        and Palettes.monColors(paletteData,species,GoldCompat.monIsShiny(mon))
         or nil
       if colors then
-        return "gen2-native-pal:"..tostring(species)..":"..tostring(mon and mon.shiny),colors
+        return "gen2-native-pal:"..tostring(species)..":"..tostring(GoldCompat.monIsShiny(mon)),colors
       end
     end
 
@@ -2196,7 +2726,7 @@ local spritePortraitResolver = (function()
     local def = data and data.pokemon and data.pokemon[mon.species]
     local vanillaPath = def and def.spriteFront
     local path, trueColor = PokemonSprites_.path(
-      data, mon.species, "front", { mon=mon, kind=kind or "battle" })
+      data, mon.species, "front", { mon=GoldCompat.spriteResolutionMon(mon), kind=kind or "battle" })
     if not path then return nil end
 
     -- If another sprite package replaces the live front path, display that
@@ -2208,7 +2738,7 @@ local spritePortraitResolver = (function()
 
     local palName, colors = enginePalette(data, mon.species, mon)
     local key = "engine:" .. path .. ":" .. (trueColor and "truecolor" or palName)
-    local cached = R.cache[key]
+    local cached = cacheGet(key)
     if cached ~= nil then
       return cached or nil, trueColor and true or false
     end
@@ -2253,7 +2783,7 @@ local spritePortraitResolver = (function()
     end
 
     if image and image.setFilter then image:setFilter("nearest","nearest") end
-    R.cache[key] = image or false
+    cachePut(key,image or false)
     return image, trueColor and true or false
   end
 
@@ -2321,6 +2851,11 @@ local function clearPokemonUIState()
   State.activeItemTargetParty=nil
   State.activeMoveLearn=nil
   State.activeTMPromptFlow=nil
+  -- A menu-only 3D actor should not survive after Pokemon UI ownership ends.
+  if GoldCompat and type(GoldCompat.releaseStadiumUiActor)=="function" then
+    GoldCompat.releaseStadiumUiActor("summary")
+    GoldCompat.releaseStadiumUiActor("pokedex")
+  end
 end
 
 local function clearOverworldMenuState()
@@ -2460,16 +2995,79 @@ for _,spec in ipairs(SCREEN_TOGGLE_SPECS) do
   OPTION_DEFAULTS[spec.key]=true
 end
 
-local function optionValue(key)
-  if modRef and modRef.options and modRef.options.get then
-    local ok, value = pcall(modRef.options.get, modRef.options, key)
-    if ok and value ~= nil then return value end
+-- Option reads sit on extremely hot render paths (every label, panel, and
+-- battle-card feature gate). The options service is event-driven, so paying a
+-- protected facade call dozens of times per frame is unnecessary. Keep the
+-- cache on GoldCompat to avoid adding top-level locals to this already-large
+-- chunk (Lua's main-function local limit is deliberately tight here).
+GoldCompat.__optionValueCache=GoldCompat.__optionValueCache or {}
+GoldCompat.__optionValueKnown=GoldCompat.__optionValueKnown or {}
+GoldCompat.__optionValueEpoch=GoldCompat.__optionValueEpoch or 0
+
+function GoldCompat.invalidateOptionValue(key,value,known)
+  if key~=nil then
+    GoldCompat.__optionValueCache[key]=value
+    GoldCompat.__optionValueKnown[key]=known~=false
+  else
+    GoldCompat.__optionValueCache={}
+    GoldCompat.__optionValueKnown={}
   end
-  return OPTION_DEFAULTS[key]
+  GoldCompat.__optionValueEpoch=(GoldCompat.__optionValueEpoch or 0)+1
+  GoldCompat.__uiMetricCache=nil
+  GoldCompat.__finalCanvasCache=nil
+  GoldCompat.__safeFullCanvasCache=nil
+end
+
+local function optionValue(key)
+  local known=GoldCompat.__optionValueKnown
+  local cache=GoldCompat.__optionValueCache
+  if known[key] then return cache[key] end
+  local value=nil
+  if modRef and modRef.options and modRef.options.get then
+    local ok, resolved = pcall(modRef.options.get, modRef.options, key)
+    if ok and resolved ~= nil then value=resolved end
+  end
+  if value==nil then value=OPTION_DEFAULTS[key] end
+  cache[key]=value
+  known[key]=true
+  return value
 end
 
 local function featureEnabled(key)
   return optionValue(key) ~= false
+end
+
+-- Early-declared renderers live above the standalone options facade in this
+-- monolithic entry chunk. Expose the cached reader through GoldCompat so those
+-- hot paths can share the same event-invalidated values without repeatedly
+-- protected-calling mod.options:get().
+GoldCompat.optionValue=optionValue
+
+-- Font width queries are another high-frequency UI cost: the same species,
+-- command labels, item names and fixed chrome are measured every frame. Cache
+-- measurements per live Font object; weak font keys let old profile/size fonts
+-- disappear naturally, and each bucket is bounded to keep dynamic dialogue from
+-- growing without limit.
+GoldCompat.__fontWidthCache=GoldCompat.__fontWidthCache
+  or setmetatable({}, {__mode="k"})
+function GoldCompat.measureFontWidth(fontObject,text)
+  if not (fontObject and type(fontObject.getWidth)=="function") then return 0 end
+  local value=tostring(text or "")
+  local bucket=GoldCompat.__fontWidthCache[fontObject]
+  if not bucket then
+    bucket={values={},count=0}
+    GoldCompat.__fontWidthCache[fontObject]=bucket
+  end
+  local cached=bucket.values[value]
+  if cached~=nil then return cached end
+  local width=fontObject:getWidth(value)
+  if (bucket.count or 0)>=384 then
+    local oldest=next(bucket.values)
+    if oldest~=nil then bucket.values[oldest]=nil; bucket.count=bucket.count-1 end
+  end
+  bucket.values[value]=width
+  bucket.count=(bucket.count or 0)+1
+  return width
 end
 
 -- Central standalone theme adapter. The mature donor renderers deliberately
@@ -2822,35 +3420,53 @@ function GoldCompat.colosseumPartyGridIndex(index,count,direction)
   return index
 end
 
+function GoldCompat.uiMetrics()
+  local epoch=GoldCompat.__optionValueEpoch or 0
+  local cached=GoldCompat.__uiMetricCache
+  if cached and cached.epoch==epoch then return cached end
+
+  local profileId=tostring(optionValue("uiTextProfile") or "og")
+  local profile=TEXT_PROFILES[profileId] or TEXT_PROFILES.og
+  local textSize=tostring(optionValue("uiTextSize") or "normal")
+  local textBase=1.00
+  if textSize=="small" then textBase=0.90
+  elseif textSize=="large" then textBase=1.12
+  elseif textSize=="x-large" then textBase=1.24 end
+
+  local weight=profile.weightOverride
+  if weight==nil then
+    local weightMode=tostring(optionValue("uiTextWeight") or "normal")
+    if weightMode=="thin" then weight=0.00
+    elseif weightMode=="bold" then weight=0.90
+    else weight=0.45 end
+  end
+
+  local boxMode=tostring(optionValue("uiBoxScale") or "normal")
+  local boxScale=1.00
+  if boxMode=="compact" then boxScale=0.86
+  elseif boxMode=="large" then boxScale=1.08
+  elseif boxMode=="x-large" then boxScale=1.14 end
+
+  cached={epoch=epoch,profile=profile,textScale=textBase*profile.sizeMul,
+    textWeight=weight,boxScale=boxScale}
+  GoldCompat.__uiMetricCache=cached
+  return cached
+end
+
 function GoldCompat.activeTextProfile()
-  local id=tostring(optionValue("uiTextProfile") or "og")
-  return TEXT_PROFILES[id] or TEXT_PROFILES.og
+  return GoldCompat.uiMetrics().profile
 end
 
 function GoldCompat.userTextScale()
-  local v=tostring(optionValue("uiTextSize") or "normal")
-  local base=1.00
-  if v=="small" then base=0.90
-  elseif v=="large" then base=1.12
-  elseif v=="x-large" then base=1.24 end
-  return base*GoldCompat.activeTextProfile().sizeMul
+  return GoldCompat.uiMetrics().textScale
 end
 
 function GoldCompat.userTextWeight()
-  local profile=GoldCompat.activeTextProfile()
-  if profile.weightOverride then return profile.weightOverride end
-  local v=tostring(optionValue("uiTextWeight") or "normal")
-  if v=="thin" then return 0.00 end
-  if v=="bold" then return 0.90 end
-  return 0.45
+  return GoldCompat.uiMetrics().textWeight
 end
 
 function GoldCompat.userBoxScale()
-  local v=tostring(optionValue("uiBoxScale") or "normal")
-  if v=="compact" then return 0.86 end
-  if v=="large" then return 1.08 end
-  if v=="x-large" then return 1.14 end
-  return 1.00
+  return GoldCompat.uiMetrics().boxScale
 end
 
 function GoldCompat.dialogueLayoutScale()
@@ -3034,6 +3650,168 @@ local function battleStateInStack(game)
     end
   end
   return nil
+end
+
+function GoldCompat.inheritBattleSurfaceFlag(state,methodName)
+  local game=(state and state.game) or (modRef and modRef.game) or GoldCompat.game
+  local battle=battleStateInStack(game)
+  if not battle or battle==state then return nil end
+  local fn=battle[methodName]
+  if type(fn)=="function" then
+    local ok,value=pcall(fn,battle)
+    if ok then return value==true end
+  end
+  -- Gen II BattleState is intrinsically a wide/fill battle screen. Older
+  -- launcher builds asked only the top overlay for these flags, so returning
+  -- the inherited truth here prevents a transparent Bag/Party/TextBox from
+  -- collapsing CBE's arena back into the 160x144 path for one frame.
+  if GoldCompat.isGen2BattleState(battle) then return true end
+  return nil
+end
+
+-- Gen II's compositor treats the topmost state that advertises a widescreen
+-- draw as the owner of the physical battle surface.  If a transparent menu
+-- merely inherits `drawsWidescreen=true` but its own drawWidescreen is a no-op,
+-- Game2 falls back to drawing the complete stack again in a centered 160x144
+-- panel.  With CBE/Stadium/other world providers this produces the duplicated
+-- arena/lens rectangle behind Bag/Party/Summary.
+--
+-- Keep the menu as the top widescreen owner, but delegate ONLY its background
+-- draw to the authoritative battle state.  The custom menu itself is painted
+-- later in render.hud.  This is provider-agnostic: CBE, Stadium, Battle Arts,
+-- vanilla, or any future battle renderer sees its normal BattleState seam once.
+function GoldCompat.drawBattleWidescreenUnderOverlay(state,winW,winH)
+  if GoldCompat.generation~="gen2" then return false end
+  local game=(state and state.game) or (modRef and modRef.game) or GoldCompat.game
+  local battle=battleStateInStack(game)
+  if not battle or battle==state or type(battle.drawWidescreen)~="function" then
+    return false
+  end
+  local ok,err=pcall(battle.drawWidescreen,battle,winW,winH)
+  if not ok then
+    if modRef and modRef.log then
+      pcall(function()
+        modRef.log("error","Colosseum UI: Gen II battle widescreen proxy failed: "
+          ..tostring(err))
+      end)
+    end
+    return false
+  end
+  return true
+end
+
+function GoldCompat.uiOwnsBattleOverlayState(state)
+  if not state or state.__gen3uiDisableBattleSurfaceProxy then return false end
+
+  -- One explicit marker is enough for every new UI flow going forward. The
+  -- legacy markers below keep all existing 2.x screens covered without
+  -- rewriting their gameplay/state logic just to rename a flag.
+  if state.__gen3uiBattleOverlay or state.__gen3uiGoldOverlayKind
+      or state.__colosseumFlowKind then return true end
+
+  if state.__gen3uiBag or state.__gen3uiBagAction
+      or state.__gen3uiColosseumParty or state.__gen3uiColosseumSummary
+      or state.__gen3uiItemTarget or state.__gen3uiKeepTMBackground
+      or state.__gen3uiPPMovePicker or state.__gen3uiBattleMoveParty
+      or state.__gen3uiGoldBattleMoveParty or state.__gen3uiPPMoveParty
+      or state.__gen3uiPPParty or state.__gen3uiLevelUpBox
+      or state.__colosseumCaughtNaming or state.__colosseumGiftNaming then
+    return true
+  end
+
+  if GoldCompat.isDialogueTextState and GoldCompat.isDialogueTextState(state)
+      and featureEnabled("revampedDialogueBoxes") then return true end
+  if GoldCompat.isDialogueChoiceState
+      and GoldCompat.isDialogueChoiceState(state)
+      and featureEnabled("revampedDialogueBoxes") then return true end
+
+  return state==State.activeBattleMoveLearn
+      or state==State.activeBattleMoveParty
+      or state==State.activeBattleStatBox
+      or state==State.activeItemTargetParty
+      or state==State.activeTMParty
+end
+
+function GoldCompat.isBattleWidescreenOverlay(state)
+  if GoldCompat.generation~="gen2" or not state then return false end
+  local game=state.game or (modRef and modRef.game) or GoldCompat.game
+  local battle=battleStateInStack(game)
+  if not battle or battle==state then return false end
+
+  -- 2.1.9: compositor ownership is a property of the STACK, not a curated
+  -- list of individual screen names. Every presentation state owned by this
+  -- overhaul uses the same contract; opaque/native full-screen states and
+  -- unrelated third-party transparent states are left completely untouched.
+  return state.isOpaque~=true and GoldCompat.uiOwnsBattleOverlayState(state)
+end
+
+function GoldCompat.stateAboveBattle(state)
+  if GoldCompat.generation~="gen2" or not state then return false,nil end
+  local game=state.game or (modRef and modRef.game) or GoldCompat.game
+  local states=game and game.stack and game.stack.states
+  if type(states)~="table" then return false,nil end
+  local battleIndex,stateIndex,battle=nil,nil,nil
+  for i=#states,1,-1 do
+    local st=states[i]
+    if st==state and not stateIndex then stateIndex=i end
+    if not battleIndex and (getmetatable(st)==BattleState
+        or st==State.activeBattle or GoldCompat.isGen2BattleState(st)) then
+      battleIndex=i
+      battle=st
+    end
+  end
+  return battleIndex~=nil and stateIndex~=nil and stateIndex>battleIndex,battle
+end
+
+-- Apply the Gen II hanging-surface contract to an INSTANCE as soon as it is
+-- pushed. This catches every UI-owned battle flow -- Pokédex, NamingScreen,
+-- nickname entry, move learning, item prompts, and future overhaul states --
+-- without requiring each class to know about Game2's compositor.
+--
+-- Game2 treats the top state with drawsWidescreen()+drawWidescreen() as the
+-- physical surface owner. If a transparent state above BattleState does not
+-- advertise that ownership, Game2 chooses the battle as `wide` and then
+-- executes its `wide ~= top` fallback, which redraws StateStack inside a
+-- centred 160x144 panel. The proxy below makes the TOP overlay own that seam
+-- while delegating only the background draw to BattleState.
+function GoldCompat.installBattleSurfaceProxy(state)
+  if GoldCompat.generation~="gen2" or type(state)~="table"
+      or state.__gen3uiBattleSurfaceProxy then return false end
+  local above,battle=GoldCompat.stateAboveBattle(state)
+  if not above or not battle or state.isOpaque==true
+      or not GoldCompat.uiOwnsBattleOverlayState(state) then return false end
+
+  local originalDraws=state.drawsWidescreen
+  local originalDrawWide=state.drawWidescreen
+  local originalFill=state.wantsFillScale
+  state.__gen3uiBattleSurfaceProxy=true
+  state.__gen3uiBattleSurfaceOriginalDraws=originalDraws
+  state.__gen3uiBattleSurfaceOriginalDrawWide=originalDrawWide
+  state.__gen3uiBattleSurfaceOriginalFill=originalFill
+
+  state.drawsWidescreen=function(self,...)
+    if GoldCompat.isBattleWidescreenOverlay(self) then return true end
+    if type(originalDraws)=="function" then return originalDraws(self,...) end
+    return false
+  end
+  state.wantsFillScale=function(self,...)
+    if GoldCompat.isBattleWidescreenOverlay(self) then
+      local inherited=GoldCompat.inheritBattleSurfaceFlag(self,"wantsFillScale")
+      if inherited~=nil then return inherited end
+      return true
+    end
+    if type(originalFill)=="function" then return originalFill(self,...) end
+    return false
+  end
+  state.drawWidescreen=function(self,winW,winH,...)
+    if GoldCompat.isBattleWidescreenOverlay(self) then
+      if GoldCompat.drawBattleWidescreenUnderOverlay(self,winW,winH) then return end
+    end
+    if type(originalDrawWide)=="function" then
+      return originalDrawWide(self,winW,winH,...)
+    end
+  end
+  return true
 end
 
 local function makeBattleMovePartyState(game,moveMenu)
@@ -3759,7 +4537,7 @@ local function fittedDialogueMetrics(lines, preferred, minimum, maxWidth, maxHei
     local f=font(size*UI_TEXT_SCALE*GoldCompat.userTextScale())
     local fitsWidth=true
     for i=1,visible do
-      if f:getWidth(tostring(lines[i] or "")) + 4 > maxWidth then
+      if GoldCompat.measureFontWidth(f,lines[i]) + 4 > maxWidth then
         fitsWidth=false
         break
       end
@@ -4106,22 +4884,35 @@ local function drawStyledHP(x, y, w, h, battler)
   local hp, mx = shownHP(battler), maxHP(battler)
   local ratio = clamp(hp / mx, 0, 1)
 
-  -- Dark HP capsule.
-  local badgeW = h * 1.95
+  -- Dark HP capsule. Treat "HP" as an icon-like micro label: respect the
+  -- selected face/weight, but fit its actual glyph bounds inside the capsule
+  -- instead of allowing a large text profile to spill across the meter.
+  local hpTextSize = h*0.68
+  local hpScale=UI_TEXT_SCALE*GoldCompat.userTextScale()
+  local hpFont = font(hpTextSize*hpScale)
+  local hpTextH = hpFont and hpFont:getHeight() or hpTextSize
+  local maxTextH=h*0.76
+  if hpTextH>maxTextH and hpTextH>0 then
+    hpTextSize=math.max(h*0.40,hpTextSize*(maxTextH/hpTextH))
+    hpFont=font(hpTextSize*hpScale)
+    hpTextH=hpFont and hpFont:getHeight() or hpTextSize
+  end
+
+  local hpPadX = h*0.18
+  local hpTextW=hpFont and hpFont:getWidth("HP") or h
+  local maxBadgeW=w*0.30
+  local maxTextW=math.max(h,maxBadgeW-hpPadX*2)
+  if hpTextW>maxTextW and hpTextW>0 then
+    hpTextSize=math.max(h*0.34,hpTextSize*(maxTextW/hpTextW))
+    hpFont=font(hpTextSize*hpScale)
+    hpTextH=hpFont and hpFont:getHeight() or hpTextSize
+    hpTextW=hpFont and hpFont:getWidth("HP") or maxTextW
+  end
+  local badgeW=math.min(maxBadgeW,math.max(h*1.95,hpTextW+hpPadX*2))
   g.setColor(0.18,0.31,0.29,1)
   roundedRect("fill", x, y, badgeW, h, h*0.38)
 
-  -- Center HP against the actual capsule/bar geometry. The old y+h*0.00
-  -- offset made the label ride high relative to the HP bar.
-  local hpTextSize = h*0.68
-  local hpFont = font(hpTextSize*UI_TEXT_SCALE*GoldCompat.userTextScale())
-  local hpTextH = hpFont and hpFont:getHeight() or hpTextSize
-
-  -- Keep a little breathing room inside the badge and bias the label upward.
-  -- Pixel fonts visually sit lower than their nominal bounding box, so a
-  -- slight negative offset looks centered against the HP bar.
-  local hpPadX = h*0.18
-  local hpTextY = y + math.max(0,(h-hpTextH)*0.5) - h*0.10
+  local hpTextY = y + math.max(0,(h-hpTextH)*0.5)
   printText("HP", x+hpPadX, hpTextY, hpTextSize,
             {0.96,0.72,0.18,1},"center",badgeW-hpPadX*2)
 
@@ -4154,15 +4945,18 @@ function GoldCompat.drawEXPRow(plateX, plateY, plateW, plateH, battle, battler, 
   -- Exact player-plate-relative geometry.
   local left = plateX + 7*s
   local right = plateX + plateW - 6*s
-  local labelW = 22*s
+  local expTextSize=3.9*s
+  local expFont=font(expTextSize*UI_TEXT_SCALE*GoldCompat.userTextScale())
+  local labelW=math.max(22*s,(expFont and expFont:getWidth("EXP") or 0)+5*s)
   local barH = 4.6*s
   local rowY = plateY + plateH - 9*s
 
-  -- EXP label: warm Gen III yellow.
+  -- EXP label: warm Gen III yellow. Measured width keeps large fonts from
+  -- entering the rail.
   pcall(printText, "EXP", left, rowY - 0.9*s,
-        3.9*s, {0.86,0.64,0.08,1})
+        expTextSize, {0.86,0.64,0.08,1})
 
-  -- Rail begins after label and stretches to the right plate inset.
+  -- Rail begins after the actual label width and stretches to the right inset.
   local barX = left + labelW
   local barW = math.max(8*s, right - barX)
 
@@ -4262,7 +5056,7 @@ end
 local function battleNameWidth(text,size)
   local ok,w=pcall(function()
     local f=font((tonumber(size) or 4)*UI_TEXT_SCALE*GoldCompat.userTextScale())
-    return f and f:getWidth(tostring(text or "")) or 0
+    return f and GoldCompat.measureFontWidth(f,text) or 0
   end)
   if ok and tonumber(w) then return w end
   return #tostring(text or "")*(tonumber(size) or 4)*0.55
@@ -4272,46 +5066,78 @@ local function drawEnemyHUD(battle, s)
   if not enemyVisible(battle) then return end
 
   local margin=7*s
-  local w,h=112*s,31*s
-  local sw=love.graphics.getWidth()
+  local w=112*s
+  local b=battle.enemy
+  local textColor={0.11,0.12,0.11,1}
+  local enemyName=displayName(b)
+  local levelText="Lv."..tostring((b.mon and b.mon.level) or "?")
+  local gender=b and b.gender
+  if gender~="male" and gender~="female" then
+    gender=directBattleGender(battle,"enemy",b)
+  end
+  local hasGender=(gender=="male" or gender=="female")
+
+  local nameSize=6.4*s
+  local levelSize=5.5*s
+  local statusSize=3.8*s
+  local hpBarH=7*s
+  local profileScale=UI_TEXT_SCALE*GoldCompat.userTextScale()
+  local levelFont=font(levelSize*profileScale)
+  local levelW=levelFont:getWidth(levelText)
+  local iconSize=hasGender and math.max(9,math.min(12,3.0*s)) or 0
+  local maxNameW=math.max(20*s,w-14*s-levelW-iconSize-(hasGender and 5*s or 2*s))
+  local drawNameSize=nameSize
+  local nameW=battleNameWidth(enemyName,drawNameSize)
+  if nameW>maxNameW and nameW>0 then
+    drawNameSize=math.max(4.2*s,drawNameSize*(maxNameW/nameW))
+    nameW=battleNameWidth(enemyName,drawNameSize)
+  end
+
+  local nameH=font(drawNameSize*profileScale):getHeight()
+  local levelH=levelFont:getHeight()
+  local headerH=math.max(nameH,levelH,iconSize)
+  local statusH=font(statusSize*profileScale):getHeight()
+  local topPad=2*s
+  local headerGap=math.max(1.5*s,1.2*s*GoldCompat.userTextScale())
+  local detailGap=math.max(1.0*s,0.8*s*GoldCompat.userTextScale())
+  -- Font profiles reflow inside the original enemy plate; they do not grow it.
+  local h=31*s
+  local enemyOverflow=topPad+headerH+headerGap+hpBarH+detailGap+statusH+2*s-h
+  if enemyOverflow>0 then
+    local take=math.min(enemyOverflow,math.max(0,headerGap-0.6*s))
+    headerGap=headerGap-take
+    enemyOverflow=enemyOverflow-take
+    take=math.min(enemyOverflow,math.max(0,detailGap-0.5*s))
+    detailGap=detailGap-take
+  end
+
   -- Corner layout: enemy always owns the upper-left edge.
   local x=margin
   local y=margin
-  local b=battle.enemy
-
   drawPlate(x,y,w,h,s)
 
-  local textColor={0.11,0.12,0.11,1}
-  local enemyName=displayName(b)
-  printText(enemyName,x+7*s,y+2.0*s,6.4*s,textColor)
-  do
-    -- presentBattleState already stamps the live Gen2 mon's gender onto this
-    -- side facade. Keep the glyph in a fixed reserved slot between name/level
-    -- so font measurement can never suppress it.
-    local gender=b and b.gender
-    if gender~="male" and gender~="female" then
-      gender=directBattleGender(battle,"enemy",b)
-    end
-    if gender=="male" or gender=="female" then
-      -- Sit immediately after the rendered Pokémon name, with a hard cap that
-      -- leaves the Lv. field untouched.
-      local nameX=x+7*s
-      local nameW=battleNameWidth(enemyName,6.4*s)
-      local gx=math.min(nameX+nameW+1.5*s, x+56*s)
-      local gy=y+5.35*s
-      local iconSize=math.max(9,math.min(12,3.0*s))
-      GoldCompat.drawGenderIcon(gx,gy,iconSize,gender)
-    end
-  end
-  printText("Lv."..tostring((b.mon and b.mon.level) or "?"),
-            x+64*s,y+2.2*s,5.5*s,textColor,"right",39*s)
+  local headerY=y+topPad
+  local nameY=headerY+math.max(0,(headerH-nameH)*0.5)
+  local levelY=headerY+math.max(0,(headerH-levelH)*0.5)
+  printText(enemyName,x+7*s,nameY,drawNameSize,textColor)
 
-  drawStyledHP(x+7*s,y+14.5*s,97*s,7*s,b)
+  local levelRight=x+w-9*s
+  local levelX=levelRight-levelW
+  if hasGender then
+    local gx=math.min(x+7*s+nameW+1.5*s,levelX-iconSize-2*s)
+    local gy=headerY+math.max(0,(headerH-iconSize)*0.5)
+    GoldCompat.drawGenderIcon(gx,gy,iconSize,gender)
+  end
+  printText(levelText,levelX,levelY,levelSize,textColor)
+
+  local hpY=headerY+headerH+headerGap
+  drawStyledHP(x+7*s,hpY,97*s,hpBarH,b)
 
   local status=statusText(battle,b)
   if status then
     local r,g,bb,aa=statusColor(status)
-    printText(status,x+8*s,y+22.0*s,3.8*s,{r,g,bb,aa})
+    local detailY=hpY+hpBarH+detailGap
+    printText(status,x+8*s,detailY,statusSize,{r,g,bb,aa})
   end
 end
 
@@ -4319,66 +5145,106 @@ local function drawPlayerHUD(battle, s, commandRect)
   if not playerVisible(battle) then return end
 
   local sw=love.graphics.getWidth()
-  local w,h=116*s,45*s
+  local w=116*s
   local margin=7*s
+  local b=battle.player
+  local textColor={0.11,0.12,0.11,1}
+  local playerName=displayName(b)
+  local levelText="Lv."..tostring((b.mon and b.mon.level) or "?")
+  local gender=b and b.gender
+  if gender~="male" and gender~="female" then
+    gender=directBattleGender(battle,"player",b)
+  end
+  local hasGender=(gender=="male" or gender=="female")
+
+  local nameSize=6.4*s
+  local levelSize=5.4*s
+  local statusSize=3.8*s
+  local hpValueSize=4.4*s
+  local hpBarH=7.2*s
+  local profileScale=UI_TEXT_SCALE*GoldCompat.userTextScale()
+  local levelFont=font(levelSize*profileScale)
+  local levelW=levelFont:getWidth(levelText)
+  local iconSize=hasGender and math.max(9,math.min(12,3.0*s)) or 0
+  local maxNameW=math.max(20*s,w-16*s-levelW-iconSize-(hasGender and 5*s or 2*s))
+  local drawNameSize=nameSize
+  local nameW=battleNameWidth(playerName,drawNameSize)
+  if nameW>maxNameW and nameW>0 then
+    drawNameSize=math.max(4.2*s,drawNameSize*(maxNameW/nameW))
+    nameW=battleNameWidth(playerName,drawNameSize)
+  end
+
+  local nameH=font(drawNameSize*profileScale):getHeight()
+  local levelH=levelFont:getHeight()
+  local headerH=math.max(nameH,levelH,iconSize)
+  local statusH=font(statusSize*profileScale):getHeight()
+  local hpValueH=font(hpValueSize*profileScale):getHeight()
+  local detailH=math.max(statusH,hpValueH)
+  local topPad=2*s
+  local headerGap=math.max(1.5*s,1.2*s*GoldCompat.userTextScale())
+  local detailGap=math.max(1.0*s,0.8*s*GoldCompat.userTextScale())
+  -- EXP row occupies the final ~9s of the plate; keep a real gap above it.
+  local expReserve=12*s
+  -- Preserve the original player plate dimensions; only internal rows reflow.
+  local h=45*s
+  local playerOverflow=topPad+headerH+headerGap+hpBarH+detailGap+detailH+expReserve-h
+  if playerOverflow>0 then
+    local take=math.min(playerOverflow,math.max(0,headerGap-0.6*s))
+    headerGap=headerGap-take
+    playerOverflow=playerOverflow-take
+    take=math.min(playerOverflow,math.max(0,detailGap-0.5*s))
+    detailGap=detailGap-take
+  end
+
   local x=sw-w-margin
   local y=commandRect.y-h-6*s
-  local b=battle.player
 
-  -- Core geometry first. These are intentionally not dependent on font rendering.
+  -- Keep the established player-plate anchor and silhouette.
   drawPlate(x,y,w,h,s)
-  drawStyledHP(x+8*s,y+13.8*s,101*s,7.2*s,b)
 
-  -- EXP is a core HUD primitive now, not a decorative tail-end draw.
-  -- It renders before any potentially failing status/number typography.
-  GoldCompat.drawEXPRow(x, y, w, h, battle, b, s)
+  local headerY=y+topPad
+  local nameY=headerY+math.max(0,(headerH-nameH)*0.5)
+  local levelY=headerY+math.max(0,(headerH-levelH)*0.5)
+  pcall(printText,playerName,x+8*s,nameY,drawNameSize,textColor)
 
-  local textColor={0.11,0.12,0.11,1}
-
-  -- Name and level are independently protected.
-  pcall(function()
-    local playerName=displayName(b)
-    printText(playerName,x+8*s,y+1.8*s,6.4*s,textColor)
-  end)
-
-  do
-    local gender=b and b.gender
-    if gender~="male" and gender~="female" then
-      gender=directBattleGender(battle,"player",b)
-    end
-    if gender=="male" or gender=="female" then
-      local playerName=displayName(b)
-      local nameX=x+8*s
-      local nameW=battleNameWidth(playerName,6.4*s)
-      local gx=math.min(nameX+nameW+1.5*s, x+58*s)
-      local gy=y+5.15*s
-      local iconSize=math.max(9,math.min(12,3.0*s))
-      GoldCompat.drawGenderIcon(gx,gy,iconSize,gender)
-    end
+  local levelRight=x+w-10*s
+  local levelX=levelRight-levelW
+  if hasGender then
+    local gx=math.min(x+8*s+nameW+1.5*s,levelX-iconSize-2*s)
+    local gy=headerY+math.max(0,(headerH-iconSize)*0.5)
+    pcall(GoldCompat.drawGenderIcon,gx,gy,iconSize,gender)
   end
-  pcall(function()
-    printText("Lv."..tostring((b.mon and b.mon.level) or "?"),
-              x+65*s,y+2.1*s,5.4*s,textColor,"right",41*s)
-  end)
+  pcall(printText,levelText,levelX,levelY,levelSize,textColor)
 
+  local hpY=headerY+headerH+headerGap
+  drawStyledHP(x+8*s,hpY,101*s,hpBarH,b)
+
+  local detailY=hpY+hpBarH+detailGap
   -- Status cannot stop HP numbers or EXP.
   pcall(function()
     local status=statusText(battle,b)
     if status then
       local r,g,bb,aa=statusColor(status)
       local lg=love.graphics
+      local statusW=math.max(25*s,battleNameWidth(status,statusSize)+6*s)
+      local statusBoxH=math.max(7*s,statusH+2*s)
       lg.setColor(r,g,bb,0.12)
-      roundedRect("fill",x+8*s,y+22.2*s,25*s,7.0*s,2.4*s)
-      printText(status,x+10*s,y+22.0*s,3.8*s,{r,g,bb,aa})
+      roundedRect("fill",x+8*s,detailY-0.2*s,statusW,statusBoxH,2.4*s)
+      printText(status,x+10*s,detailY,statusSize,{r,g,bb,aa})
       lg.setColor(1,1,1,1)
     end
   end)
 
-  -- Numeric HP is also isolated.
+  -- Numeric HP anchors to the right edge of the detail row using its measured
+  -- width; it can no longer drift upward into the meter as text size changes.
   pcall(function()
     local hpText=tostring(shownHP(b)).." / "..tostring(maxHP(b))
-    printText(hpText,x+55*s,y+21.8*s,4.4*s,textColor,"right",53*s)
+    local hpTextW=battleNameWidth(hpText,hpValueSize)
+    printText(hpText,x+w-9*s-hpTextW,detailY,hpValueSize,textColor)
   end)
+
+  -- EXP remains anchored to the fixed plate bottom.
+  GoldCompat.drawEXPRow(x, y, w, h, battle, b, s)
 end
 
 function GoldCompat.drawBattleGenderOverlay(battle,s,commandRect)
@@ -4487,19 +5353,28 @@ local function drawCommandMenu(battle)
     local y = rect.y+pad+opt.row*(cellH+gap)
     local selected = battle.menuIndex == opt.index
 
+    local labelSize=cellH*0.43
+    local labelFont=font(labelSize*UI_TEXT_SCALE*GoldCompat.userTextScale())
+    local labelH=labelFont and labelFont:getHeight() or labelSize
+    local baseLabelY=y+cellH*0.12
+    local labelY=clamp(baseLabelY,y+3*u,y+math.max(3*u,cellH-labelH-3*u))
+
     if selected then
       g.setColor(0.16,0.30,0.42,1)
       roundedRect("fill", x,y,cellW,cellH,10*u)
       g.setColor(0.95,0.36,0.17,1)
-      roundedRect("fill", x+6*u,y+7*u,5*u,cellH-14*u,2*u)
-      printText(opt.label, x+18*u, y+cellH*0.12, cellH*0.43,
+      local indicatorH=clamp(labelH*0.78,8*u,cellH-12*u)
+      local indicatorY=clamp(labelY+(labelH-indicatorH)*0.5,
+        y+6*u,y+cellH-indicatorH-6*u)
+      roundedRect("fill", x+6*u,indicatorY,5*u,indicatorH,2*u)
+      printText(opt.label, x+18*u, labelY, labelSize,
                 {0.98,0.98,0.96,1}, "center", cellW-28*u)
     else
       g.setColor(0.86,0.87,0.84,1)
       roundedRect("fill", x,y,cellW,cellH,10*u)
       g.setColor(0.97,0.97,0.95,1)
       roundedRect("fill", x+2*u,y+2*u,cellW-4*u,cellH-4*u,8*u)
-      printText(opt.label, x+10*u, y+cellH*0.12, cellH*0.43,
+      printText(opt.label, x+10*u, labelY, labelSize,
                 {0.12,0.14,0.16,1}, "center", cellW-20*u)
     end
   end
@@ -4539,10 +5414,8 @@ local function drawDialogue(battle)
     return
   end
 
-  local rect = GoldCompat.dialogueGeometry()
-  drawPanelBase(rect)
-
   local g = love.graphics
+  local sw,sh=g.getDimensions()
   local lines = messageLines(battle)
   local fullLines = GoldCompat.messagePageFullLines(battle)
   local textColor = {0.12,0.14,0.16,1}
@@ -4551,24 +5424,52 @@ local function drawDialogue(battle)
     or battle.msgPrompt
     or battle.msgHold
     or (battle.current and battle.current.done)
-  -- Reserve extra pixels for the 0.45px weight pass and raster rounding.
-  -- Without this, a line that mathematically fits exactly can lose its last
-  -- one or two glyphs at the right scissor edge.
-  local contentW = math.max(1, rect.w-60)
+
+  local metricSource=(#fullLines>0 and fullLines or lines)
+  local rect = GoldCompat.dialogueGeometry()
   local preferred = clamp(rect.h*0.36,34,50)
   local minimum = math.max(18,preferred*0.62)
 
-  -- Font metrics are chosen from the COMPLETE current page, not from the
-  -- characters revealed so far. Typewriter progression therefore never
-  -- changes font size or line spacing mid-message.
-  local innerTop = 10
+  -- Measure the configured profile at its requested size BEFORE committing to
+  -- the shell. Wide/tall fonts expand the panel instead of being forced through
+  -- geometry tuned for the default face.
+  local preferredFont=font(preferred*UI_TEXT_SCALE*GoldCompat.userTextScale())
+  local preferredGlyphH=math.max(1,preferredFont:getHeight())
+  local preferredLineH=math.max(preferredGlyphH+3,math.ceil(preferredGlyphH*1.10))
+  local preferredMaxW=0
+  for i=1,math.min(2,#metricSource) do
+    preferredMaxW=math.max(preferredMaxW,
+      GoldCompat.measureFontWidth(preferredFont,metricSource[i]))
+  end
+  local measuredRows=math.max(1,math.min(2,#metricSource))
+  local preferredBlockH=preferredGlyphH+
+    math.max(0,measuredRows-1)*preferredLineH
+
+  local margin=clamp(sw*0.018,20,36)
+  local maxRectW=math.max(220,sw-margin*2)
+  local maxRectH=math.max(80,sh-margin*2)
+  local desiredW=math.max(rect.w,preferredMaxW+70)
+  local desiredH=math.max(rect.h,preferredBlockH+42)
+  rect.w=math.min(maxRectW,desiredW)
+  rect.h=math.min(maxRectH,desiredH)
+  if featureEnabled("mobileBattleUI") then
+    rect.x=(sw-rect.w)*0.5
+    rect.y=(sh-rect.h)*0.5
+  else
+    rect.x=margin
+    rect.y=sh-rect.h-margin
+  end
+
+  -- Reserve extra pixels for the weight pass and continuation marker.
+  local contentW = math.max(1, rect.w-60)
+  local innerTop = 12
   local innerBottom = 22
   local innerH = math.max(1,rect.h-innerTop-innerBottom)
 
-  local metricSource=(#fullLines>0 and fullLines or lines)
   local metricKey=tostring(battle.current and battle.current.text or "")
       .."|"..table.concat(metricSource,"\n")
       .."|"..tostring(pageComplete)
+      .."|profile="..tostring(optionValue("uiTextProfile"))
       .."|text="..tostring(optionValue("uiTextSize"))
       .."|weight="..tostring(optionValue("uiTextWeight"))
       .."|box="..tostring(optionValue("uiBoxScale"))
@@ -4578,7 +5479,6 @@ local function drawDialogue(battle)
   if not battle.__gen3MetricCache
       or battle.__gen3MetricCache.key~=metricKey then
     local size,glyphH,lineH,blockH,wrapped
-
     if pageComplete then
       size,glyphH,lineH,blockH,wrapped=GoldCompat.fittedCompletedDialogue(
         metricSource,preferred,minimum,contentW,innerH)
@@ -4586,7 +5486,6 @@ local function drawDialogue(battle)
       size,glyphH,lineH,blockH=fittedDialogueMetrics(
         metricSource,preferred,minimum,contentW,innerH)
     end
-
     battle.__gen3MetricCache={
       key=metricKey,size=size,glyphH=glyphH,lineH=lineH,blockH=blockH,
       wrapped=wrapped,
@@ -4596,19 +5495,26 @@ local function drawDialogue(battle)
   local metrics=battle.__gen3MetricCache
   local size,glyphH,lineH,blockH=
     metrics.size,metrics.glyphH,metrics.lineH,metrics.blockH
-
-  if pageComplete and metrics.wrapped then
-    lines=metrics.wrapped
-  end
+  if pageComplete and metrics.wrapped then lines=metrics.wrapped end
   local visible=math.min(2,#lines)
 
-  local x = rect.x+24
+  -- Grow once more if a profile has unusual ascent/descent metrics that differ
+  -- from the preferred probe. This makes the font authoritative over height.
+  local neededH=blockH+innerTop+innerBottom
+  if neededH>rect.h and neededH<=maxRectH then
+    rect.h=neededH
+    if featureEnabled("mobileBattleUI") then rect.y=(sh-rect.h)*0.5
+    else rect.y=sh-rect.h-margin end
+    innerH=math.max(1,rect.h-innerTop-innerBottom)
+  end
 
-  -- Fixed safe baselines. Dynamic vertical centering was vulnerable to
-  -- fractional font-height rounding on some renderer/scaling combinations,
-  -- which let line two touch or cross the bottom border.
-  local firstY = rect.y + 13
-  local secondY = rect.y + rect.h - glyphH - 18
+  drawPanelBase(rect)
+
+  local x = rect.x+24
+  -- Center the complete glyph block using the loaded font's real line box.
+  -- Integer rounding keeps the result stable across fractional window scales.
+  local firstY=math.floor(rect.y+innerTop+
+    math.max(0,(innerH-blockH)*0.5)+0.5)
 
   g.setScissor(
     math.floor(rect.x+18),
@@ -4616,25 +5522,22 @@ local function drawDialogue(battle)
     math.floor(rect.w-36),
     math.floor(rect.h-18)
   )
-
   if visible >= 1 then
     printText(lines[1],x,firstY,size,textColor,"left",contentW)
   end
   if visible >= 2 then
-    printText(lines[2],x,secondY,size,textColor,"left",contentW)
+    printText(lines[2],x,firstY+lineH,size,textColor,"left",contentW)
   end
-
   g.setScissor()
 
   if (battle.msgWaiting or battle.msgPrompt)
       and battle.frame % 60 < 30 then
-    -- clean modern continue marker
-    local g = love.graphics
     g.setColor(0.20,0.31,0.42,1)
     local cx = rect.x+rect.w-31
     local cy = rect.y+rect.h-22
     g.polygon("fill", cx,cy, cx+13,cy, cx+6.5,cy+9)
   end
+  g.setColor(1,1,1,1)
 end
 
 
@@ -4702,12 +5605,19 @@ local function drawMoveSelect(battle)
     local selected = battle.moveIndex == i
     local disabled = battle.player.disabledSlot == i
     local marked = battle.moveSwapIndex == i
+    local primarySize=clamp(rowH * 0.40, 16*u, 34*u)
+    local primaryFont=font(primarySize*UI_TEXT_SCALE*GoldCompat.userTextScale())
+    local primaryH=primaryFont and primaryFont:getHeight() or primarySize
+    local primaryY=clamp(y+rowH*0.13,y+3*u,y+math.max(3*u,rowH-primaryH-3*u))
 
     if selected then
       g.setColor(0.16, 0.30, 0.42, 1)
       roundedRect("fill", rect.x + pad, y, rect.w - pad*2, rowH, 9*u)
       g.setColor(0.95, 0.36, 0.17, 1)
-      roundedRect("fill", rect.x + pad + 6*u, y + 6*u, 5*u, rowH - 12*u, 2*u)
+      local indicatorH=clamp(primaryH*0.78,8*u,rowH-12*u)
+      local indicatorY=clamp(primaryY+(primaryH-indicatorH)*0.5,
+        y+6*u,y+rowH-indicatorH-6*u)
+      roundedRect("fill", rect.x + pad + 6*u, indicatorY, 5*u, indicatorH, 2*u)
     else
       g.setColor(0.86, 0.87, 0.84, 1)
       roundedRect("fill", rect.x + pad, y, rect.w - pad*2, rowH, 9)
@@ -4729,8 +5639,8 @@ local function drawMoveSelect(battle)
                              or {0.62,0.30,0.26,1}
       end
 
-      local nameSize = clamp(rowH * 0.40, 16*u, 34*u)
-      printText(label, rect.x + pad + 18*u, y + rowH*0.13,
+      local nameSize = primarySize
+      printText(label, rect.x + pad + 18*u, primaryY,
                 nameSize, textColor)
 
       local ppText = ("%d / %d"):format(curPP, maxPP)
@@ -4743,8 +5653,8 @@ local function drawMoveSelect(battle)
                   selected and {0.98,0.84,0.34,1} or {0.64,0.46,0.08,1})
       end
     else
-      printText("—", rect.x + pad + 18*u, y + rowH*0.13,
-                clamp(rowH*0.34, 14*u, 28*u),
+      printText("—", rect.x + pad + 18*u, primaryY,
+                primarySize,
                 selected and {0.98,0.98,0.96,0.5}
                          or {0.35,0.36,0.37,0.55})
     end
@@ -5865,8 +6775,13 @@ local function installOverworldUI(mod)
   SummaryMenu.new = function(...)
     local self=originalSummaryNew(...)
     if self then
-      self.isOpaque=GoldCompat.pokemonPresentationEnabled()
-        and false or originalSummaryOpaque
+      local enabled=GoldCompat.pokemonPresentationEnabled()
+      self.isOpaque=enabled and false or originalSummaryOpaque
+      -- Mark presentation ownership at construction time. API-v2 resolves
+      -- screen visibility before draw(), so draw-time ownership is too late
+      -- to guarantee that the battle/overworld beneath this hanging panel is
+      -- preserved on its very first frame.
+      self.__gen3uiColosseumSummary=enabled and true or nil
     end
     return self
   end
@@ -6316,6 +7231,11 @@ end
 
 local function finalCanvas()
   local sw, sh = love.graphics.getDimensions()
+  local boxScale=GoldCompat.userBoxScale()
+  local key=tostring(sw)..":"..tostring(sh)..":"..tostring(boxScale)
+  local cached=GoldCompat.__finalCanvasCache
+  if cached and cached.key==key then return cached.ox,cached.oy,cached.scale end
+
   local raw = math.min(sw / 160, sh / 144)
   local scale = math.floor(raw)
   if scale < 1 then scale = raw end
@@ -6324,7 +7244,6 @@ local function finalCanvas()
   -- fit-scale slightly. Most hanging panels have generous logical margins,
   -- so this makes LARGE / X-LARGE visibly meaningful without changing their
   -- internal layout. COMPACT still shrinks normally.
-  local boxScale=GoldCompat.userBoxScale()
   if boxScale>1 then
     scale=math.min(scale*boxScale,raw*1.14)
   else
@@ -6333,6 +7252,7 @@ local function finalCanvas()
 
   local ox = math.floor((sw - 160*scale) * 0.5 + 0.5)
   local oy = math.floor((sh - 144*scale) * 0.5 + 0.5)
+  GoldCompat.__finalCanvasCache={key=key,ox=ox,oy=oy,scale=scale}
   return ox, oy, scale
 end
 
@@ -6378,17 +7298,24 @@ local function safeFullCanvas(marginPx)
   local sw,sh=love.graphics.getDimensions()
   local margin=marginPx or 4
   local rail=GoldCompat.dexActionRailActive and 56 or 0
+  local boxScale=GoldCompat.userBoxScale()
+  local key=tostring(sw)..":"..tostring(sh)..":"..tostring(margin)..":"
+    ..tostring(rail)..":"..tostring(boxScale)
+  local cached=GoldCompat.__safeFullCanvasCache
+  if cached and cached.key==key then return cached.ox,cached.oy,cached.scale end
+
   -- Reserve a matching phantom rail on the right. This keeps the Pokédex
   -- itself centered when the real action rail appears on its left instead of
   -- centering the asymmetric combined assembly and shoving the Dex sideways.
   local raw=math.min((sw-margin*2)/(160+rail*2),(sh-margin*2)/144)
   local base=math.floor(math.min(sw/160,sh/144))
   if base<1 then base=math.min(sw/160,sh/144) end
-  local requested=base*GoldCompat.userBoxScale()
+  local requested=base*boxScale
   local scale=math.min(requested,raw)
   if scale<=0 then scale=raw end
   local ox=math.floor((sw-160*scale)*0.5+0.5)
   local oy=math.floor((sh-144*scale)*0.5+0.5)
+  GoldCompat.__safeFullCanvasCache={key=key,ox=ox,oy=oy,scale=scale}
   return ox,oy,scale
 end
 
@@ -6409,7 +7336,7 @@ end
 
 local function finalTextWidth(text, logicalSize, sc)
   local pxSize = math.max(4, math.floor(logicalSize*sc + 0.5))
-  return font(pxSize*UI_TEXT_SCALE*GoldCompat.userTextScale()):getWidth(tostring(text or "")) / math.max(sc,0.001)
+  return GoldCompat.measureFontWidth(font(pxSize*UI_TEXT_SCALE*GoldCompat.userTextScale()),text) / math.max(sc,0.001)
 end
 
 -- Option values are user-selected readability settings, so they must remain
@@ -6961,7 +7888,7 @@ local function partyTextWidth(text, size)
   local sc = math.max(0.001, partyRenderScale or 1)
   -- Global readability polish: a deliberately small bump, not a redesign.
   local pxSize = math.max(4, math.floor(size * sc + 0.5))
-  return font(pxSize*UI_TEXT_SCALE*GoldCompat.userTextScale()):getWidth(tostring(text or "")) / sc
+  return GoldCompat.measureFontWidth(font(pxSize*UI_TEXT_SCALE*GoldCompat.userTextScale()),text) / sc
 end
 
 local function partyText(text, x, y, size, color, align, width)
@@ -7331,6 +8258,8 @@ function GoldCompat.drawColosseumParty(game, state)
     partyText(text,sx,dy+32,1.9,{0.78,0.84,0.80,1},"center",statW)
   end
 
+  local submenuOpen=state.submenu~=nil and state.submenu~=false
+
   -- Reference-style split prompt and Exit blocks.
   panel(5,130,117,10,false,0.88)
   panel(125,130,30,10,false,0.88)
@@ -7356,41 +8285,91 @@ function GoldCompat.drawColosseumParty(game, state)
     promptSize=promptSize-0.10
   end
   partyText(prompt,9,133,promptSize,{0.98,0.98,0.94,1},"left",107)
-  partyText("B: EXIT",128,133,2.25,{0.98,0.98,0.94,1},"center",24)
+  partyText(submenuOpen and "B: BACK" or "B: EXIT",128,133,2.25,
+    {0.98,0.98,0.94,1},"center",24)
 
   -- Both generations retain their native submenu objects and actions.
+  -- Battle switching is especially important here: the engine keeps the real
+  -- SWITCH / STATS / CANCEL input state on PartyMenu, while this overhaul
+  -- suppresses PartyMenu's native draw. Never let that leave the player with
+  -- an invisible decision surface. Gen I stores `submenu=true` + subItems;
+  -- Gold stores a submenu table and marks the battle flavour on that table.
   local submenuItems=state.subItems
   local submenuIndex=state.subIndex
-  if type(state.submenu)=="table"
-      and type(state.submenu.items)=="table" then
-    submenuItems=state.submenu.items
-    submenuIndex=state.submenu.index
+  local submenuState=type(state.submenu)=="table" and state.submenu or nil
+  if submenuState and type(submenuState.items)=="table" then
+    submenuItems=submenuState.items
+    submenuIndex=submenuState.index
   end
-  if state.submenu and submenuItems then
+
+  local battleSubmenu=submenuOpen and (
+      state.wantsBattleSubmenu==true
+      or (submenuState and submenuState.battle==true)
+      or (state.battle and state.onSwitch~=nil))
+
+  -- Defensive presentation fallback only. It does NOT own input or callbacks;
+  -- those stay on the native PartyMenu. This merely guarantees visible rows if
+  -- a facade/runtime revision temporarily omits the presentational item table.
+  if battleSubmenu and type(submenuItems)~="table" then
+    submenuItems={
+      {label="SWITCH",action="battle_switch"},
+      {label="STATS",action="stats"},
+      {label="CANCEL",action="cancel"},
+    }
+    submenuIndex=tonumber(submenuIndex) or 1
+  end
+
+  if submenuOpen and type(submenuItems)=="table" and #submenuItems>0 then
     local count=#submenuItems
-    local sw=42
-    local sh=math.min(64,6+count*10)
     local leftMargin=math.max(0,ox/sc)
-    -- Widescreen has a natural rail beside the 160x144 party canvas. Use it
-    -- for actions so STATS/MOVES never cover the selected-Pokémon data deck.
-    -- On narrow 4:3 windows, dock above the left party column instead.
-    local sx=leftMargin>=sw+4 and -(sw+3) or 5
-    -- Center the widescreen action rail vertically beside the Party deck.
-    -- Its former y=83 anchor packed six-item menus against (and sometimes
-    -- beyond) the bottom edge at larger UI/text profiles.
-    local sy=leftMargin>=sw+4 and math.max(18,(144-sh)*0.5) or 5
-    panel(sx,sy,sw,sh,true,0.96)
-    for i,entry in ipairs(submenuItems) do
-      local yy=sy+3+(i-1)*10
-      local picked=i==(submenuIndex or 1)
-      if picked then
-        g.setColor(0.62,0.14,0.09,0.96)
-        roundedRect("fill",sx+3,yy,sw-6,9,1.5)
+
+    if battleSubmenu then
+      -- BattleMonMenu gets a dedicated, guaranteed-visible action pod. On
+      -- widescreen it hangs in the free rail; on 4:3 it overlays the right
+      -- party column just like the original battle action box. This avoids the
+      -- generic action rail ever being clipped/off-canvas during a battle.
+      local sw=46
+      local sh=10+count*9
+      local sx=leftMargin>=sw+4 and -(sw+3) or 109
+      local sy=math.max(18,math.floor((82-sh)*0.5)+18)
+      panel(sx,sy,sw,sh,true,0.985)
+      partyText("BATTLE",sx+5,sy+3,1.75,{1.00,0.72,0.28,1},"left",sw-10)
+      for i,entry in ipairs(submenuItems) do
+        local yy=sy+8+(i-1)*9
+        local picked=i==(tonumber(submenuIndex) or 1)
+        if picked then
+          g.setColor(0.62,0.14,0.09,0.98)
+          roundedRect("fill",sx+3,yy,sw-6,8,1.5)
+        end
+        local label=type(entry)=="table"
+          and (entry.label or entry.name or entry.id) or entry
+        partyText(tostring(label or ""),sx+6,yy+1.7,2.45,
+          picked and {1,1,1,1} or {0.86,0.90,0.88,1},"left",sw-10)
       end
-      local label=type(entry)=="table"
-        and (entry.label or entry.name or entry.id) or entry
-      partyText(tostring(label or ""),sx+6,yy+2,2.6,
-        picked and {1,1,1,1} or {0.86,0.90,0.88,1},"left",sw-10)
+    else
+      local sw=42
+      local sh=math.min(64,6+count*10)
+      -- Widescreen has a natural rail beside the 160x144 party canvas. Use it
+      -- for actions so STATS/MOVES never cover the selected-Pokémon data deck.
+      -- On narrow 4:3 windows, dock above the left party column instead.
+      local sx=leftMargin>=sw+4 and -(sw+3) or 5
+      -- Center the widescreen action rail vertically beside the Party deck.
+      -- Its former y=83 anchor packed six-item menus against (and sometimes
+      -- beyond) the bottom edge at larger UI/text profiles.
+      local sy=leftMargin>=sw+4 and math.max(18,(144-sh)*0.5) or 5
+      panel(sx,sy,sw,sh,true,0.96)
+      for i,entry in ipairs(submenuItems) do
+        local yy=sy+3+(i-1)*10
+        local picked=i==(tonumber(submenuIndex) or 1)
+        if picked then
+          g.setColor(0.62,0.14,0.09,0.96)
+          roundedRect("fill",sx+3,yy,sw-6,9,1.5)
+        end
+        local label=type(entry)=="table"
+          and (entry.label or entry.name or entry.id) or entry
+        partyText(tostring(label or ""),sx+6,yy+2,2.6,
+          picked and {1,1,1,1} or {0.86,0.90,0.88,1},"left",sw-10)
+      end
     end
   end
 
@@ -9208,18 +10187,30 @@ function GoldCompat.drawDialogueThemeFinal(box)
   local page=box and box.pages and box.pages[box.pageIndex]
   local complete=box and (box.waiting or box.done)
   local lines={}
+  local sourceLines={}
   for i=1,visible do
     local revealed=GoldCompat.dialogueVisibleText(box,i)
     local sourceIndex=(tonumber(box.lineIndex) or #shown)-(#shown-i)
     local source=page and tostring(page[sourceIndex] or "") or revealed
     source=source:gsub("\v","")
+    sourceLines[i]=source
     lines[i]=complete and source or revealed
   end
   if #lines==0 then lines[1]="" end
+  if #sourceLines==0 then sourceLines[1]=lines[1] end
 
   local waiting=box and (box.waiting
     or (box.done and not box.choice and not box.auto and not box.stay))
-  return shared(lines,waiting,box and box.blink or 0)
+
+  -- Keep the KNOWN-GOOD shared final-HUD presentation path. Gen 2 overworld
+  -- dialogue gets compact geometry only; it never switches to a separate
+  -- renderer that can fail after the native TextBox has already been hidden.
+  if GoldCompat.isGen2Game(box and box.game)
+      and not battleStateInStack(box and box.game) then
+    return GoldCompat.drawCompactGen2DialogueStable(lines,sourceLines,waiting,
+      box and box.blink or 0)
+  end
+  return shared(lines,waiting,box and box.blink or 0,sourceLines)
 end
 
 local function safeFooterText(text,lx,ly,size,color,ox,oy,sc,maxWidth)
@@ -9303,8 +10294,8 @@ function DexUI.drawPartySummary(game, state)
   -- Keep the same active sprite-source resolver used by Party/PC/Pokédex.
   g.push("all")
   g.origin()
-  pcall(GoldCompat.drawCleanResolvedPortrait,game,mon,
-    ox+13*sc,oy+48*sc,47*sc,39*sc,"summary")
+  pcall(GoldCompat.drawStatsInformationPortrait,game,mon,
+    ox+13*sc,oy+48*sc,47*sc,39*sc)
   g.pop()
 
   finalText(("#%03d"):format(tonumber(def.dex) or 0),10,91,3.25,
@@ -9854,6 +10845,27 @@ end
 -- Normalize encounter labels once so both PokéDex presentations expose the
 -- same route/method information without changing the generation adapters.
 function DexUI.encounterDisplayRows(game,speciesId)
+  -- Gen I encounter tables are immutable for the lifetime of a loaded dataset,
+  -- yet the Strategy Memo used to rescan every map/group/slot on every render
+  -- frame. That cost is especially visible while a 3D information actor is
+  -- also rendering. Cache the normalized rows per dataset/species. Gen II keeps
+  -- its live path because roamers can legitimately move while the session runs.
+  local cacheBucket=nil
+  if game and not GoldCompat.isGen2Game(game) then
+    local source=game.data and game.data.encounters
+    if type(source)=="table" then
+      GoldCompat.__gen1DexEncounterCache=GoldCompat.__gen1DexEncounterCache
+        or setmetatable({}, {__mode="k"})
+      cacheBucket=GoldCompat.__gen1DexEncounterCache[source]
+      if not cacheBucket then
+        cacheBucket={}
+        GoldCompat.__gen1DexEncounterCache[source]=cacheBucket
+      end
+      local cached=cacheBucket[speciesId]
+      if cached then return cached end
+    end
+  end
+
   local rows=DexUI.encounters(game,speciesId)
   local displayRows={}
   local displaySeen={}
@@ -9883,6 +10895,7 @@ function DexUI.encounterDisplayRows(game,speciesId)
       end
     end
   end
+  if cacheBucket then cacheBucket[speciesId]=displayRows end
   return displayRows
 end
 
@@ -9916,281 +10929,10 @@ function DexUI.ball(ox,oy,sc,lx,ly,caught)
   g.pop()
 end
 
-function DexUI.draw(game,state)
-  if not (game and state and state.items) then return end
-
-  local ox,oy,sc=safeFullCanvas()
-  local g=love.graphics
-  local index=state.__gen3uiDexIndex
-  if not index then
-    index=DexUI.buildIndex(game)
-    state.__gen3uiDexIndex=index
-  end
-
-  local total=#state.items
-  local selected=math.max(1,math.min(state.index or 1,math.max(1,total)))
-  local entry=index[selected]
-  local speciesId=entry and entry.id
-  local def=entry and entry.def
-  local dex=(game.save and game.save.pokedex) or {seen={},owned={}}
-
-  local seen=speciesId and (
-    (dex.seen and dex.seen[speciesId]) or
-    (dex.owned and dex.owned[speciesId])
-  )
-  local owned=speciesId and dex.owned and dex.owned[speciesId]
-
-  local seenCount,ownedCount=0,0
-  for _,e in pairs(index) do
-    if dex.owned and dex.owned[e.id] then
-      ownedCount=ownedCount+1
-      seenCount=seenCount+1
-    elseif dex.seen and dex.seen[e.id] then
-      seenCount=seenCount+1
-    end
-  end
-
-  g.push("all")
-  g.translate(ox,oy)
-  g.scale(sc,sc)
-
-  g.setColor(0.94,0.93,0.87,1)
-  g.rectangle("fill",0,0,160,144)
-
-  g.setColor(0.08,0.08,0.08,1)
-  g.rectangle("fill",4,4,152,17)
-  g.setColor(0.99,0.985,0.955,1)
-  g.rectangle("fill",5,5,150,15)
-
-  g.setColor(0.12,0.12,0.11,1)
-  roundedRect("fill",4,25,88,104,3)
-  roundedRect("fill",95,25,61,104,3)
-  g.setColor(0.99,0.985,0.95,1)
-  roundedRect("fill",6,27,84,100,2)
-  roundedRect("fill",97,27,57,100,2)
-
-  setCurrentBorderColor(1)
-  roundedRect("line",7,28,82,98,2)
-  roundedRect("line",98,28,55,98,2)
-
-  g.setColor(0.08,0.08,0.08,1)
-  g.rectangle("fill",4,132,152,8)
-  g.pop()
-
-  finalText("POKéDEX",9,8,5.0,{0.06,0.06,0.06,1},ox,oy,sc)
-  finalText(("SEEN %d  CAUGHT %d"):format(seenCount,ownedCount),
-    79,8,3.15,{0.18,0.18,0.17,1},ox,oy,sc,"right",72)
-
-  local shownName=(seen and def and def.name) or "-----"
-  local selectedDex=(entry and tonumber(entry.dex))
-      or (def and tonumber(def.dex)) or selected
-  finalText(("#%03d  %s"):format(selectedDex,shownName),
-    11,32,4.2,{0.07,0.07,0.07,1},ox,oy,sc,"left",74)
-
-  finalText("STATUS",11,44,2.7,{0.38,0.38,0.35,1},ox,oy,sc)
-  finalText(owned and "CAUGHT" or (seen and "SEEN" or "UNKNOWN"),
-    11,49,3.4,
-    owned and {0.16,0.42,0.20,1}
-      or (seen and {0.46,0.35,0.10,1} or {0.42,0.42,0.40,1}),
-    ox,oy,sc)
-
-  if seen and def then
-    finalText("SPECIES",11,58,2.5,{0.38,0.38,0.35,1},ox,oy,sc)
-    finalText(DexUI.speciesLabel(def),11,63,3.0,{0.08,0.08,0.08,1},
-      ox,oy,sc,"left",42)
-
-    finalText("HT",11,70,2.5,{0.38,0.38,0.35,1},ox,oy,sc)
-    finalText(DexUI.heightLabel(def),21,70,2.9,{0.08,0.08,0.08,1},
-      ox,oy,sc,"left",24)
-
-    finalText("WT",47,70,2.5,{0.38,0.38,0.35,1},ox,oy,sc)
-    finalText(DexUI.weightLabel(def),57,70,2.9,{0.08,0.08,0.08,1},
-      ox,oy,sc,"left",28)
-  else
-    finalText("SPECIES",11,58,2.5,{0.38,0.38,0.35,1},ox,oy,sc)
-    finalText("N/A",11,63,3.0,{0.42,0.42,0.40,1},ox,oy,sc)
-  end
-
-  -- Match Party/PC compatibility: resolve the selected species through the
-  -- live battle-sprite path so equipped sprite packs carry into the Pokédex.
-  if seen and speciesId then
-    g.push("all")
-    g.origin()
-    pcall(GoldCompat.drawCleanResolvedPortrait,game,{species=speciesId},
-      ox+60*sc,oy+38*sc,24*sc,23*sc,"dex")
-    g.pop()
-  end
-
-  finalText("WILD LOCATIONS",11,82,2.7,{0.38,0.38,0.35,1},ox,oy,sc)
-
-  local displayRows=(seen and speciesId)
-    and DexUI.encounterDisplayRows(game,speciesId) or {}
-
-  if #displayRows==0 then
-    finalText("N/A",11,90,3.7,{0.12,0.12,0.11,1},ox,oy,sc)
-  else
-    for i=1,math.min(3,#displayRows) do
-      local row=displayRows[i]
-      local y=89+(i-1)*10
-      finalText(row.area,11,y,2.9,{0.08,0.08,0.08,1},
-        ox,oy,sc,"left",51)
-      finalText(row.method,63,y,2.6,{0.34,0.26,0.08,1},
-        ox,oy,sc,"left",23)
-    end
-    if #displayRows>3 then
-      finalText((" +%d MORE"):format(#displayRows-3),11,119,2.6,
-        {0.38,0.38,0.35,1},ox,oy,sc)
-    end
-  end
-
-  local visibleRows=8
-  local first=math.max(1,selected-math.floor(visibleRows/2))
-  if total>visibleRows then
-    first=math.min(first,total-visibleRows+1)
-  end
-
-  for row=1,visibleRows do
-    local n=first+row-1
-    local item=state.items[n]
-    if not item then break end
-
-    local e=index[n]
-    local id=e and e.id
-    local isSeen=id and (
-      (dex.seen and dex.seen[id]) or
-      (dex.owned and dex.owned[id])
-    )
-    local caught=id and dex.owned and dex.owned[id]
-    local name=(isSeen and e and e.def and e.def.name) or "-----"
-    local y=31+(row-1)*11
-
-    if n==selected then
-      g.push("all")
-      g.translate(ox,oy)
-      g.scale(sc,sc)
-      g.setColor(0.10,0.10,0.10,1)
-      roundedRect("fill",99,y-2,53,10,2)
-      g.pop()
-    end
-
-    DexUI.ball(ox,oy,sc,103,y+2,caught)
-    local rowDex=(e and tonumber(e.dex))
-        or (e and e.def and tonumber(e.def.dex)) or n
-    finalText(("%03d"):format(rowDex),107,y,2.6,
-      n==selected and {0.98,0.97,0.92,1} or {0.34,0.34,0.32,1},
-      ox,oy,sc)
-    finalText(name,120,y,2.8,
-      n==selected and {0.98,0.97,0.92,1} or {0.08,0.08,0.08,1},
-      ox,oy,sc,"left",30)
-  end
-
-  safeFooterText("A: OPTIONS   B: BACK   ←/→: PAGE",9,134,2.5,
-    {0.96,0.95,0.90,1},ox,oy,sc,142)
-end
-
-
-function DexUI.drawEntry(game,state)
-  if not (game and state and state.def) then return end
-
-  local ox,oy,sc=safeFullCanvas()
-  local g=love.graphics
-  local def=state.def
-  local e=def.dexEntry or {}
-  local dex=(game.save and game.save.pokedex) or {owned={}}
-  local owned=state.forceOwned or (dex.owned and dex.owned[def.id])
-
-  g.push("all")
-  g.translate(ox,oy)
-  g.scale(sc,sc)
-
-  g.setColor(0.94,0.93,0.87,1)
-  g.rectangle("fill",0,0,160,144)
-
-  -- Header
-  g.setColor(0.08,0.08,0.08,1)
-  g.rectangle("fill",4,4,152,17)
-  g.setColor(0.99,0.985,0.955,1)
-  g.rectangle("fill",5,5,150,15)
-
-  -- Main card
-  g.setColor(0.12,0.12,0.11,1)
-  roundedRect("fill",4,25,152,104,3)
-  g.setColor(0.99,0.985,0.95,1)
-  roundedRect("fill",6,27,148,100,2)
-  setCurrentBorderColor(1)
-  roundedRect("line",7,28,146,98,2)
-
-  -- Footer
-  g.setColor(0.08,0.08,0.08,1)
-  g.rectangle("fill",4,132,152,8)
-  g.pop()
-
-  finalText("POKéDEX DATA",9,8,4.8,{0.06,0.06,0.06,1},ox,oy,sc)
-
-  -- Sprite panel on left.
-  if def.id then
-    g.push("all")
-    g.origin()
-    pcall(GoldCompat.drawCleanResolvedPortrait,game,{species=def.id},
-      ox+12*sc,oy+34*sc,43*sc,42*sc,"dex")
-    g.pop()
-  end
-
-  finalText(tostring(def.name or "-----"),61,32,4.5,
-    {0.07,0.07,0.07,1},ox,oy,sc,"left",86)
-
-  finalText(tostring(e.kind or "N/A"):upper(),61,42,3.8,
-    {0.34,0.34,0.31,1},ox,oy,sc,"left",86)
-
-  finalText(("No. %03d"):format(tonumber(def.dex) or 0),61,51,3.8,
-    {0.08,0.08,0.08,1},ox,oy,sc)
-
-  if owned then
-    finalText("HT",61,61,3.25,{0.38,0.38,0.35,1},ox,oy,sc)
-    finalText(DexUI.heightLabel(def),73,61,3.55,
-      {0.08,0.08,0.08,1},ox,oy,sc,"left",29)
-
-    finalText("WT",104,61,3.25,{0.38,0.38,0.35,1},ox,oy,sc)
-    finalText(DexUI.weightLabel(def),116,61,3.55,
-      {0.08,0.08,0.08,1},ox,oy,sc,"left",32)
-  else
-    finalText("DATA UNKNOWN",61,61,3.0,
-      {0.42,0.42,0.40,1},ox,oy,sc)
-  end
-
-  -- Native DexEntry description source, presented in our card.
-  local description=nil
-  if owned and e.text and game.data and game.data.text then
-    description=game.data.text[e.text]
-  end
-
-  finalText("ENTRY",12,77,3.45,{0.38,0.38,0.35,1},ox,oy,sc)
-
-  if description and tostring(description)~="" then
-    local clean=GoldCompat.cleanWrappedText(description)
-
-    -- Wrap in logical Pokédex pixels, not final screen pixels. Multiplying
-    -- this width by sc made the renderer believe an entire paragraph fit on
-    -- one line at high window scales.
-    local entrySize=4.35
-    local entryWidth=132
-    local f=font(entrySize*UI_TEXT_SCALE*GoldCompat.userTextScale())
-    local _,wrapped=f:getWrap(clean,entryWidth)
-    local maxLines=4
-
-    for i=1,math.min(maxLines,#wrapped) do
-      finalText(wrapped[i],12,87+(i-1)*10,entrySize,
-        {0.08,0.08,0.08,1},ox,oy,sc,"left",entryWidth)
-    end
-  else
-    finalText("Data unknown.",12,88,3.2,
-      {0.30,0.30,0.28,1},ox,oy,sc)
-  end
-
-  safeFooterText("A / B: BACK",9,134,2.6,
-    {0.96,0.95,0.90,1},ox,oy,sc,142)
-end
-
+-- The original cartridge-paper Dex list/DATA renderers were removed in 2.2.0.
+-- Strategy Memo below has been the authoritative DexUI.draw/drawEntry path since
+-- 2.1.x; keeping both full implementations only inflated the monolithic chunk and
+-- made regressions easier to introduce. Input/state ownership remains native.
 
 function DexUI.drawAction(game,state)
   if not state then return end
@@ -10327,16 +11069,36 @@ function DexUI.drawStrategyMemo(game,state)
   local entry=index[selected]
   local def=entry and entry.def
   local species=entry and entry.id
+  local memo=state.__gen3uiDexMemo
+  local memoEpoch=GoldCompat.__optionValueEpoch or 0
+  if not memo or memo.species~=species or memo.def~=def or memo.epoch~=memoEpoch then
+    memo={species=species,def=def,epoch=memoEpoch}
+    if def then
+      memo.typeLabel=DexUI.memoTypeLabel(def)
+      memo.abilityLabel=DexUI.memoAbilityLabel(game,def)
+      memo.heightLabel=DexUI.heightLabel(def)
+      memo.weightLabel=DexUI.weightLabel(def)
+    end
+    state.__gen3uiDexMemo=memo
+  end
   local dex=(game.save and game.save.pokedex) or {}
   local ownedSet=dex.caught or dex.owned or {}
   local seenSet=dex.seen or {}
   local seen=species and (seenSet[species] or ownedSet[species])
   local caught=species and ownedSet[species]
-  local seenCount,ownedCount=0,0
-  for _,e in ipairs(index) do
-    if ownedSet[e.id] then ownedCount=ownedCount+1; seenCount=seenCount+1
-    elseif seenSet[e.id] then seenCount=seenCount+1 end
+  local countCache=state.__gen3uiDexCounts
+  if not countCache or countCache.seenSet~=seenSet or countCache.ownedSet~=ownedSet
+      or countCache.index~=index then
+    local seenCount,ownedCount=0,0
+    for _,e in ipairs(index) do
+      if ownedSet[e.id] then ownedCount=ownedCount+1; seenCount=seenCount+1
+      elseif seenSet[e.id] then seenCount=seenCount+1 end
+    end
+    countCache={seenSet=seenSet,ownedSet=ownedSet,index=index,
+      seen=seenCount,owned=ownedCount}
+    state.__gen3uiDexCounts=countCache
   end
+  local seenCount,ownedCount=countCache.seen,countCache.owned
 
   G.push("all"); G.translate(ox,oy); G.scale(sc,sc)
   G.setColor(0.018,0.040,0.044,0.78); roundedRect("fill",3,3,154,128,5)
@@ -10386,9 +11148,14 @@ function DexUI.drawStrategyMemo(game,state)
     ox,oy,sc,"left",37)
   local encounterRows={}
   if seen and def and species then
+    local previewMon=state.__gen3uiDexPreviewMon
+    if not previewMon or previewMon.species~=species then
+      previewMon={species=species}
+      state.__gen3uiDexPreviewMon=previewMon
+    end
     G.push("all"); G.origin()
-    pcall(GoldCompat.drawCleanResolvedPortrait,game,{species=species},
-      ox+74*sc,oy+29*sc,33*sc,34*sc,"dex")
+    pcall(GoldCompat.drawPokedexInformationPortrait,game,previewMon,
+      ox+74*sc,oy+29*sc,33*sc,34*sc)
     G.pop()
 
     -- Use the otherwise empty dossier column for immediately useful habitat
@@ -10449,15 +11216,15 @@ function DexUI.drawStrategyMemo(game,state)
         ox,oy,sc,"left",76)
     else
       finalText("TYPE",72,70,1.9,{0.45,0.86,0.58,1},ox,oy,sc)
-      finalText(DexUI.memoTypeLabel(def),72,76,2.5,{0.98,0.99,0.96,1},
+      finalText(memo.typeLabel or "N/A",72,76,2.5,{0.98,0.99,0.96,1},
         ox,oy,sc,"left",76)
       finalText("ABILITY",72,85,1.9,{0.45,0.86,0.58,1},ox,oy,sc)
-      finalText(DexUI.memoAbilityLabel(game,def),72,91,2.15,{0.98,0.99,0.96,1},
+      finalText(memo.abilityLabel or "N/A",72,91,2.15,{0.98,0.99,0.96,1},
         ox,oy,sc,"left",76)
       finalText("HEIGHT",72,101,1.9,{0.45,0.86,0.58,1},ox,oy,sc)
-      finalText(DexUI.heightLabel(def),72,107,2.35,{0.98,0.99,0.96,1},ox,oy,sc)
+      finalText(memo.heightLabel or "N/A",72,107,2.35,{0.98,0.99,0.96,1},ox,oy,sc)
       finalText("WEIGHT",111,101,1.9,{0.45,0.86,0.58,1},ox,oy,sc)
-      finalText(DexUI.weightLabel(def),111,107,2.35,{0.98,0.99,0.96,1},ox,oy,sc)
+      finalText(memo.weightLabel or "N/A",111,107,2.35,{0.98,0.99,0.96,1},ox,oy,sc)
     end
   else
     finalText("Encounter this POKéMON",73,77,2.35,{0.68,0.78,0.74,1},
@@ -10477,6 +11244,16 @@ end
 function DexUI.drawStrategyEntry(game,state)
   if not (game and state and state.def) then return end
   local def=state.def
+  local memo=state.__gen3uiDexEntryMemo
+  local memoEpoch=GoldCompat.__optionValueEpoch or 0
+  if not memo or memo.def~=def or memo.epoch~=memoEpoch then
+    memo={def=def,epoch=memoEpoch,
+      typeLabel=DexUI.memoTypeLabel(def),
+      abilityLabel=DexUI.memoAbilityLabel(game,def),
+      heightLabel=DexUI.heightLabel(def),
+      weightLabel=DexUI.weightLabel(def)}
+    state.__gen3uiDexEntryMemo=memo
+  end
   local ox,oy,sc=safeFullCanvas()
   local G=love.graphics
   G.push("all"); G.translate(ox,oy); G.scale(sc,sc)
@@ -10492,16 +11269,21 @@ function DexUI.drawStrategyEntry(game,state)
   G.pop()
   finalText("PokéDex",12,13,3.15,{0.42,1.00,0.52,1},ox,oy,sc)
   finalText(tostring(def.name or "UNKNOWN"),73,31,3.7,{1,1,1,1},ox,oy,sc)
-  finalText("TYPE  "..DexUI.memoTypeLabel(def),73,44,2.5,
+  finalText("TYPE  "..memo.typeLabel,73,44,2.5,
     {0.95,0.82,0.32,1},ox,oy,sc,"left",72)
-  finalText("ABILITY  "..DexUI.memoAbilityLabel(game,def),73,54,2.15,
+  finalText("ABILITY  "..memo.abilityLabel,73,54,2.15,
     {0.92,0.97,0.93,1},ox,oy,sc,"left",72)
-  finalText("HT  "..DexUI.heightLabel(def),73,66,2.4,{0.70,0.84,0.78,1},ox,oy,sc)
-  finalText("WT  "..DexUI.weightLabel(def),111,66,2.4,{0.70,0.84,0.78,1},ox,oy,sc)
+  finalText("HT  "..memo.heightLabel,73,66,2.4,{0.70,0.84,0.78,1},ox,oy,sc)
+  finalText("WT  "..memo.weightLabel,111,66,2.4,{0.70,0.84,0.78,1},ox,oy,sc)
   if def.id then
+    local previewMon=state.__gen3uiDexPreviewMon
+    if not previewMon or previewMon.species~=def.id then
+      previewMon={species=def.id}
+      state.__gen3uiDexPreviewMon=previewMon
+    end
     G.push("all"); G.origin()
-    pcall(GoldCompat.drawCleanResolvedPortrait,game,{species=def.id},
-      ox+14*sc,oy+31*sc,47*sc,52*sc,"dex")
+    pcall(GoldCompat.drawPokedexInformationPortrait,game,previewMon,
+      ox+14*sc,oy+31*sc,47*sc,52*sc)
     G.pop()
   end
   local description=nil
@@ -10517,8 +11299,15 @@ function DexUI.drawStrategyEntry(game,state)
   end
   finalText("MEMO",15,97,2.0,{0.45,0.86,0.58,1},ox,oy,sc)
   local clean=GoldCompat.cleanWrappedText(description or "Species data registered.")
-  local f=font(2.65*UI_TEXT_SCALE*GoldCompat.userTextScale())
-  local _,wrapped=f:getWrap(clean,128)
+  local wrapEpoch=GoldCompat.__optionValueEpoch or 0
+  local wrapCache=state.__gen3uiDexMemoWrap
+  if not wrapCache or wrapCache.text~=clean or wrapCache.epoch~=wrapEpoch then
+    local f=font(2.65*UI_TEXT_SCALE*GoldCompat.userTextScale())
+    local _,wrapped=f:getWrap(clean,128)
+    wrapCache={text=clean,epoch=wrapEpoch,lines=wrapped}
+    state.__gen3uiDexMemoWrap=wrapCache
+  end
+  local wrapped=wrapCache.lines or {}
   for i=1,math.min(3,#wrapped) do
     finalText(wrapped[i],15,104+(i-1)*6.5,2.65,{0.92,0.97,0.93,1},
       ox,oy,sc,"left",128)
@@ -10604,12 +11393,15 @@ function DexUI.hudLayer(game,viewport)
 end
 
 function DexUI.hud(next,game,viewport)
-  -- Keep the native scene outside the theme adapter; only the custom Pokédex
-  -- layer receives the Colosseum material translation.
+  -- Strategy Memo is already a purpose-built Colosseum surface. Running it
+  -- through the legacy donor-screen skin adapter needlessly intercepted every
+  -- setColor call made by the Pokédex *and* by a 3D provider drawing into its
+  -- preview canvas. Gen 1 paid that Lua wrapper cost on every model material
+  -- draw while Gen 2's dedicated path did not. Draw this authored surface
+  -- directly; the native scene remains untouched underneath it.
   next(game,viewport)
-  return GoldCompat.withColosseumSkin(DexUI.hudLayer,game,viewport)
+  return DexUI.hudLayer(game,viewport)
 end
-
 
 
 -- Starter confirmation is still owned by the native ChoiceBox/script flow.
@@ -11055,7 +11847,7 @@ function GoldCompat.installGen1WorldZoneSafety()
               and not GoldCompat.__loggedWorldZoneSafety then
             GoldCompat.__loggedWorldZoneSafety=true
             if modRef and modRef.log then
-              modRef.log:info("Colosseum UI 1.1.0: blocked missing Gen I dialogue worldZones fallback")
+              modRef.log:info("Colosseum UI 2.2.3: blocked missing Gen I dialogue worldZones fallback")
             end
           end
           worldZones=GoldCompat.clonePaletteZones(
@@ -11102,6 +11894,70 @@ local function installDialogueThemeDirect(mod)
   -- red/black base-screen flashes during chained dialogue and menu handoffs.
   TextBox.isOpaque=false
   ChoiceBox.isOpaque=false
+  local originalTextDrawsWidescreen=TextBox.drawsWidescreen
+  local originalTextWantsFillScale=TextBox.wantsFillScale
+  local originalChoiceDrawsWidescreen=ChoiceBox.drawsWidescreen
+  local originalChoiceWantsFillScale=ChoiceBox.wantsFillScale
+  local originalTextDrawWidescreen=TextBox.drawWidescreen
+  local originalChoiceDrawWidescreen=ChoiceBox.drawWidescreen
+  TextBox.drawWidescreen=function(self,...)
+    if featureEnabled("revampedDialogueBoxes") then
+      local inherited=GoldCompat.inheritBattleSurfaceFlag(self,"drawsWidescreen")
+      if inherited~=nil then return inherited end
+    end
+    if type(originalTextDrawsWidescreen)=="function" then
+      return originalTextDrawsWidescreen(self,...)
+    end
+    return false
+  end
+  TextBox.wantsFillScale=function(self,...)
+    if featureEnabled("revampedDialogueBoxes") then
+      local inherited=GoldCompat.inheritBattleSurfaceFlag(self,"wantsFillScale")
+      if inherited~=nil then return inherited end
+    end
+    if type(originalTextWantsFillScale)=="function" then
+      return originalTextWantsFillScale(self,...)
+    end
+    return false
+  end
+  ChoiceBox.drawsWidescreen=function(self,...)
+    if featureEnabled("revampedDialogueBoxes") then
+      local inherited=GoldCompat.inheritBattleSurfaceFlag(self,"drawsWidescreen")
+      if inherited~=nil then return inherited end
+    end
+    if type(originalChoiceDrawsWidescreen)=="function" then
+      return originalChoiceDrawsWidescreen(self,...)
+    end
+    return false
+  end
+  ChoiceBox.wantsFillScale=function(self,...)
+    if featureEnabled("revampedDialogueBoxes") then
+      local inherited=GoldCompat.inheritBattleSurfaceFlag(self,"wantsFillScale")
+      if inherited~=nil then return inherited end
+    end
+    if type(originalChoiceWantsFillScale)=="function" then
+      return originalChoiceWantsFillScale(self,...)
+    end
+    return false
+  end
+  TextBox.drawWidescreen=function(self,winW,winH,...)
+    if GoldCompat.generation=="gen2" and featureEnabled("revampedDialogueBoxes")
+        and GoldCompat.drawBattleWidescreenUnderOverlay(self,winW,winH) then
+      return
+    end
+    if type(originalTextDrawWidescreen)=="function" then
+      return originalTextDrawWidescreen(self,winW,winH,...)
+    end
+  end
+  ChoiceBox.drawWidescreen=function(self,winW,winH,...)
+    if GoldCompat.generation=="gen2" and featureEnabled("revampedDialogueBoxes")
+        and GoldCompat.drawBattleWidescreenUnderOverlay(self,winW,winH) then
+      return
+    end
+    if type(originalChoiceDrawWidescreen)=="function" then
+      return originalChoiceDrawWidescreen(self,winW,winH,...)
+    end
+  end
   local originalTextUpdate=TextBox.update
   TextBox.update=function(self,dt)
     -- Gen I can complete and replace script-owned dialogue states between the
@@ -11427,6 +12283,88 @@ local function installPCIntegration()
     return menu
   end
 
+  -- Gen1Recomp 2.52+ owns the Gen I Pokédex CONTENTS screen with the
+  -- dedicated src.ui.PokedexMenu state. Older Colosseum UI builds only
+  -- recognized the historical generic ListMenu titled POKéDEX, so the new
+  -- state bypassed the overhaul completely and rendered the cartridge UI.
+  -- Adapt the dedicated state at its native seam: input/scroll/A/B and side
+  -- actions stay engine-owned; only presentation is suppressed/replaced.
+  do
+    local okPokedex,PokedexMenu=pcall(require,"src.ui.PokedexMenu")
+    if okPokedex and PokedexMenu and type(PokedexMenu.new)=="function"
+        and not PokedexMenu.__colosseumGen1Wrapped then
+      PokedexMenu.__colosseumGen1Wrapped=true
+      local nativePokedexNew=PokedexMenu.new
+      local nativePokedexDraw=PokedexMenu.draw
+
+      PokedexMenu.new=function(game,opts,...)
+        local list=nativePokedexNew(game,opts,...)
+        if list then
+          list.__gen3uiPokedex=true
+          if featureEnabled("revampedPokedex") then list.isOpaque=false end
+          DexUI.active=list
+          list.__gen3uiDexLocationPage=0
+          list.__gen3uiDexLastIndex=list.index
+
+          -- The dedicated Gen I state still has no native SELECT action. Keep
+          -- the Strategy Memo location-page shortcut that the old ListMenu
+          -- adapter provided, without changing any other native controls.
+          if type(list.update)=="function" and not list.__gen3uiDexUpdateWrapped then
+            list.__gen3uiDexUpdateWrapped=true
+            local nativeDexUpdate=list.update
+            list.update=function(self,dt,...)
+              if self.index~=self.__gen3uiDexLastIndex then
+                self.__gen3uiDexLastIndex=self.index
+                self.__gen3uiDexLocationPage=0
+              end
+              local input=self.game and self.game.input
+              if input and featureEnabled("revampedPokedex")
+                  and input:wasPressed("select") then
+                local dexIndex=self.__gen3uiDexIndex or DexUI.buildIndex(self.game)
+                self.__gen3uiDexIndex=dexIndex
+                local total=#(self.items or {})
+                local selected=clamp(self.index or 1,1,math.max(1,total))
+                local entry=dexIndex[selected]
+                local speciesId=entry and entry.id
+                local dex=(self.game.save and self.game.save.pokedex) or {}
+                local seen=speciesId and ((dex.seen and dex.seen[speciesId])
+                  or (dex.caught and dex.caught[speciesId])
+                  or (dex.owned and dex.owned[speciesId]))
+                local pageCount=seen and speciesId
+                  and #DexUI.encounterDisplayRows(self.game,speciesId) or 0
+                if pageCount>0 then
+                  self.__gen3uiDexLocationPage=
+                    ((self.__gen3uiDexLocationPage or 0)+1)%(pageCount+1)
+                  pcall(function()
+                    require("src.core.Sound").play(self.game.data,"Press_AB")
+                  end)
+                end
+                return
+              end
+              return nativeDexUpdate(self,dt,...)
+            end
+          end
+        end
+        return list
+      end
+
+      if type(nativePokedexDraw)=="function" then
+        PokedexMenu.draw=function(self,...)
+          if self.__gen3uiPokedex and featureEnabled("revampedPokedex")
+              and not self.__gen3uiPokedexRenderFailed then
+            self.isOpaque=false
+            DexUI.active=self
+            State.activeBagMenu=nil
+            State.activePCList=nil
+            return
+          end
+          if DexUI.active==self then DexUI.active=nil end
+          return nativePokedexDraw(self,...)
+        end
+      end
+    end
+  end
+
   local originalListMenuNew=ListMenu.new
   ListMenu.new=function(game,title,items,opts,...)
     local list=originalListMenuNew(game,title,items,opts,...)
@@ -11609,6 +12547,9 @@ local function handleModOptionChanged(mod,payload)
     DexUI.active=nil
     DexUI.action=nil
     DexUI.entry=nil
+    if GoldCompat and type(GoldCompat.releaseStadiumUiActor)=="function" then
+      GoldCompat.releaseStadiumUiActor("pokedex")
+    end
   elseif payload.key == "revampedDialogueBoxes" and payload.value == false then
     State.activeDialogueBox=nil
     State.activeChoiceBox=nil
@@ -11667,7 +12608,7 @@ function GoldCompat.drawGearFitted(value,x,y,w,h,size,minSize,color,align)
   local floorSize=math.min(candidate,tonumber(minSize) or 7)
   local function metrics(s)
     local f=font(math.max(4,s*UI_TEXT_SCALE*GoldCompat.userTextScale()))
-    return f:getWidth(text),f:getHeight()
+    return GoldCompat.measureFontWidth(f,text),f:getHeight()
   end
   local tw,th=metrics(candidate)
   local widthScale=math.max(1,w-2)/math.max(1,tw)
@@ -12343,74 +13284,312 @@ function GoldCompat.prepareCleanResolvedPortrait(image,sourceMeta)
 end
 
 -- -------------------------------------------------------------------------
--- Optional Stadium 3D models for Pokemon information surfaces.
+-- Provider-selected 3D Pokemon models for information surfaces.
 --
--- StadiumBattleFX owns extraction, source selection, actor lifetime internals,
--- skeletal animation and rendering. This UI consumes only its public v1 model
--- service. If Stadium is not the selected model provider, the service is not
--- ready, or a species is outside the exported model range, the existing
--- spritePortraitResolver path below remains authoritative.
+-- The UI never owns or rebuilds model assets. It asks the presentation bridge
+-- for the SAME portable actor provider currently selected for battle (CBE,
+-- Stadium/third-party models, etc.) and keeps only lightweight actor handles.
+-- 2D providers continue through spritePortraitResolver, whose prepared images
+-- are cached by source path/settings and reused across Party/PC/Pokedex/Summary.
+-- Party cards/detail and PC boxes remain on their established 2D portrait path.
 -- -------------------------------------------------------------------------
 GoldCompat.__stadiumUiActors=GoldCompat.__stadiumUiActors or {}
+GoldCompat.__stadiumUiActorCache=GoldCompat.__stadiumUiActorCache or {}
+GoldCompat.__stadiumUiPending=GoldCompat.__stadiumUiPending or {}
+GoldCompat.__presentationProviderEpoch=GoldCompat.__presentationProviderEpoch or 0
+GoldCompat.__loadedModCache=GoldCompat.__loadedModCache or {}
+GoldCompat.__stadiumUiDexCache=GoldCompat.__stadiumUiDexCache
+  or setmetatable({}, {__mode="k"})
 
-function GoldCompat.releaseStadiumUiActor(kind)
-  local slots=GoldCompat.__stadiumUiActors
-  local entry=slots and slots[kind]
+function GoldCompat.invalidatePresentationProviders(clearHandles)
+  GoldCompat.__presentationProviderEpoch=(GoldCompat.__presentationProviderEpoch or 0)+1
+  GoldCompat.__stableInformationProvider=nil
+  if clearHandles~=false then GoldCompat.__loadedModCache={} end
+end
+
+function GoldCompat.stadiumUiClock()
+  if love and love.timer and type(love.timer.getTime)=="function" then
+    local value=love.timer.getTime()
+    if tonumber(value) then return tonumber(value) end
+  end
+  return os.clock and os.clock() or 0
+end
+
+function GoldCompat.releaseStadiumUiEntry(entry)
   if not entry then return end
   if entry.actor and type(entry.actor.release)=="function" then
     pcall(entry.actor.release,entry.actor)
   end
-  slots[kind]=nil
+  if entry.canvas and type(entry.canvas.release)=="function" then
+    pcall(entry.canvas.release,entry.canvas)
+  end
+  entry.actor=nil
+  entry.canvas=nil
+  entry.viewProjectionCache=nil
 end
 
-function GoldCompat.stadiumUiModelService(game)
+function GoldCompat.releaseStadiumUiActor(kind)
+  local slots=GoldCompat.__stadiumUiActors
+  local cacheRoot=GoldCompat.__stadiumUiActorCache
+  local released={}
+  local function releaseOne(entry)
+    if entry and not released[entry] then
+      released[entry]=true
+      GoldCompat.releaseStadiumUiEntry(entry)
+    end
+  end
+  releaseOne(slots and slots[kind])
+  local cache=cacheRoot and cacheRoot[kind]
+  if cache and type(cache.entries)=="table" then
+    for _,entry in pairs(cache.entries) do releaseOne(entry) end
+  end
+  if slots then slots[kind]=nil end
+  if cacheRoot then cacheRoot[kind]=nil end
+  if GoldCompat.__stadiumUiPending then GoldCompat.__stadiumUiPending[kind]=nil end
+end
+
+function GoldCompat.stadiumUiCache(kind)
+  -- Summary used to be the expensive exception: changing party members
+  -- released the actor + preview canvas and immediately reacquired both. Keep
+  -- the six party specimens warm just like the Pokédex keeps a bounded LRU.
+  if kind~="pokedex" and kind~="summary" then return nil end
+  local root=GoldCompat.__stadiumUiActorCache
+  local cache=root[kind]
+  if not cache then
+    cache={entries={},limit=(kind=="summary" and 6 or 12)}
+    root[kind]=cache
+  end
+  return cache
+end
+
+function GoldCompat.stadiumUiRememberActor(kind,entry)
+  local cache=GoldCompat.stadiumUiCache(kind)
+  if not (cache and entry and entry.modelKey) then return end
+  entry.lastUsed=GoldCompat.stadiumUiClock()
+  cache.entries[entry.modelKey]=entry
+
+  local count=0
+  for _ in pairs(cache.entries) do count=count+1 end
+  while count>(cache.limit or 12) do
+    local oldestKey,oldestEntry,oldestTime=nil,nil,math.huge
+    local current=GoldCompat.__stadiumUiActors and GoldCompat.__stadiumUiActors[kind]
+    for key,candidate in pairs(cache.entries) do
+      if candidate~=current then
+        local used=tonumber(candidate.lastUsed) or 0
+        if used<oldestTime then
+          oldestKey,oldestEntry,oldestTime=key,candidate,used
+        end
+      end
+    end
+    if not oldestKey then break end
+    cache.entries[oldestKey]=nil
+    GoldCompat.releaseStadiumUiEntry(oldestEntry)
+    count=count-1
+  end
+end
+
+function GoldCompat.stadiumUiCachedActor(kind,modelKey)
+  local cache=GoldCompat.stadiumUiCache(kind)
+  local entry=cache and cache.entries and cache.entries[modelKey]
+  if not (entry and entry.actor and entry.api) then return nil end
+  entry.lastUsed=GoldCompat.stadiumUiClock()
+  return entry
+end
+
+function GoldCompat.stadiumUiSelectionSettled(kind,modelKey)
+  if kind~="pokedex" then return true end
+  local pendingRoot=GoldCompat.__stadiumUiPending
+  local now=GoldCompat.stadiumUiClock()
+  local pending=pendingRoot[kind]
+  if not pending or pending.modelKey~=modelKey then
+    pendingRoot[kind]={modelKey=modelKey,since=now}
+    return false
+  end
+  -- Do not synchronously materialize a genuinely cold ROM-backed model for
+  -- every intermediate row while the player is scrolling. Warm/provider-cached
+  -- assets bypass this gate entirely; cold 3D providers leave the model pod
+  -- clean rather than flashing a different 2D presentation into it.
+  return (now-(tonumber(pending.since) or now))>=0.16
+end
+
+function GoldCompat.findLoadedMod(id)
   if not (modRef and type(modRef.find)=="function") then return nil end
-  local ok,handle=pcall(modRef.find,"STADIUM_BATTLE_FX")
-  if not ok or not handle then
-    ok,handle=pcall(modRef.find,modRef,"STADIUM_BATTLE_FX")
-  end
-  if not (ok and handle and type(handle.exports)=="table") then return nil end
+  local cache=GoldCompat.__loadedModCache
+  local cached=cache[id]
+  if cached~=nil then return cached~=false and cached or nil end
+  local ok,handle=pcall(modRef.find,id)
+  if not ok or not handle then ok,handle=pcall(modRef.find,modRef,id) end
+  handle=(ok and handle) or nil
+  cache[id]=handle or false
+  return handle
+end
 
-  local exports=handle.exports
-  local models=exports.models
-  if not (type(models)=="table" and tonumber(models.version or 0)>=1
-      and type(models.available)=="function"
-      and type(models.acquire)=="function"
-      and type(models.draw)=="function") then
-    return nil
+function GoldCompat.cbeInformationModelService(game,mon,kind)
+  if kind~="summary" and kind~="pokedex" then
+    return nil,"not-information-surface"
   end
 
-  -- Respect the user's selected battle-model provider. Merely installing
-  -- StadiumBattleFX is not permission to replace another selected model source.
-  local battles=exports.battles
-  if type(battles)=="table" and exports.modelProvider
-      and type(battles.resolve)=="function" then
-    local resolvedOk,resolved=pcall(battles.resolve,battles,"models",{game=game})
-    if resolvedOk and resolved and resolved~=exports.modelProvider then return nil end
+  local request={game=game,mon=mon,kind=kind}
+  local providerEpoch=GoldCompat.__presentationProviderEpoch or 0
+  local stable=GoldCompat.__stableInformationProvider
+  if stable and stable.epoch==providerEpoch and stable.game==game
+      and stable.providerId=="cbe:colosseum-pokemon"
+      and stable.api and stable.context then
+    local context=stable.context
+    context.game=game
+    context.sides=context.sides or {}
+    context.sides.player=context.sides.player or {}
+    local battler=context.sides.player.battler
+    if type(battler)~="table" then battler={};context.sides.player.battler=battler end
+    battler.mon=mon
+    return stable.api,stable.providerId,context,stable.owner
   end
-  return models,exports
+
+  local cbe=GoldCompat.findLoadedMod("COLOSSEUM_BATTLE_ENVIRONMENTS")
+  if not cbe then cbe=GoldCompat.findLoadedMod("colosseum_battle_environments") end
+  local bridge=cbe and cbe.exports and cbe.exports.informationModels
+  local bridgeVersion=type(bridge)=="table" and tonumber(bridge.version or 0) or 0
+
+  -- CBE v4+ explicitly exposes the selected presentation provider. v1-v3's
+  -- `resolve` already has the same arbitration semantics, so prefer it before
+  -- any provider-specific showroom seam. This is the key performance rule:
+  -- menus reuse the battle provider's own warm assets rather than creating a
+  -- second CBE-only lifecycle.
+  if bridgeVersion>=1 then
+    local candidates={}
+    if bridgeVersion>=4 and type(bridge.resolveSelected)=="function" then
+      candidates[1]=bridge.resolveSelected
+    elseif type(bridge.resolve)=="function" then
+      candidates[1]=bridge.resolve
+    end
+    local lastReason="resolved-presentation-is-2d"
+    for _,resolver in ipairs(candidates) do
+      local ok,api,providerId,context,owner=pcall(resolver,bridge,request)
+      if not ok or not api then
+        local ok2,a2,p2,c2,o2=pcall(resolver,request)
+        if ok2 and a2 then ok,api,providerId,context,owner=true,a2,p2,c2,o2
+        elseif ok then lastReason=tostring(providerId or lastReason)
+        else lastReason=tostring(api or a2 or lastReason) end
+      end
+      if ok and type(api)=="table"
+          and tonumber(api.version or 0)>=1
+          and type(api.acquire)=="function"
+          and type(api.withRenderer)=="function" then
+        providerId=tostring(providerId or "selected-portable-actors")
+        if providerId=="cbe:colosseum-pokemon" and type(context)=="table" then
+          GoldCompat.__stableInformationProvider={epoch=providerEpoch,game=game,
+            providerId=providerId,api=api,context=context,owner=owner}
+        end
+        return api,providerId,context,owner
+      end
+    end
+    -- A valid bridge returning no actor means the selected presentation is 2D.
+    -- Do NOT fall through to resolveShowroom/resolveColosseum and silently swap
+    -- the user's Battle Arts/custom sprite choice for CBE models.
+    return nil,lastReason
+  end
+
+  -- CBE is optional. StadiumBattleFX can expose the portable actor service on
+  -- its own, so information menus can still share Stadium's provider cache when
+  -- CBE is not installed. Respect Stadium's presentation registry when present:
+  -- installing Stadium must never force its models over Battle Arts/custom art
+  -- when a different provider (or OFF) is selected.
+  local stadium=GoldCompat.findLoadedMod("STADIUM_BATTLE_FX")
+  local exports=stadium and stadium.exports
+  local api=exports and exports.models
+  if type(api)=="table" and tonumber(api.version or 0)>=1
+      and type(api.acquire)=="function" and type(api.withRenderer)=="function" then
+    local context={apiVersion=1,game=game,battle=nil,
+      sides={player={battler={mon=mon}},enemy={battler=nil}},
+      phase="information",progress=1,groundY=0,
+      services={informationSurface=true,showroom=true}}
+    local registry=exports and exports.battles
+    if type(registry)=="table" and tonumber(registry.version or 0)>=1
+        and type(registry.selectedId)=="function" and type(registry.resolve)=="function" then
+      local okSelected,selectedId=pcall(registry.selectedId,registry,"models")
+      selectedId=okSelected and tostring(selectedId or "stadium:default") or "off"
+      if selectedId=="off" then return nil,"stadium-models-off" end
+      local okResolve,provider,entry=pcall(registry.resolve,registry,"models",context)
+      if okResolve then
+        local resolvedId=(type(entry)=="table" and entry.id) or selectedId
+        local builtin=exports and exports.modelProvider
+        if provider==builtin or resolvedId=="stadium:default" then
+          return api,tostring(resolvedId),context,stadium.id
+        end
+        -- Portable third-party model providers selected through Stadium's
+        -- registry use the same UI actor/cache path as Stadium itself.
+        if type(provider)=="table" and tonumber(provider.version or 0)>=1
+            and type(provider.acquire)=="function" and type(provider.withRenderer)=="function"
+            and provider.hostRender~=true then
+          return provider,tostring(resolvedId),context,stadium.id
+        end
+        -- A selected sprite/private-renderer provider intentionally resolves
+        -- through the UI's normal sprite resolver instead.
+        return nil,"stadium-selected-provider-is-not-portable-3d"
+      end
+      return nil,"stadium-provider-resolution-failed"
+    end
+    -- Legacy Stadium releases predate provider selection. Their models API was
+    -- itself the selected presentation; retain compatibility with that contract.
+    if type(api.selected)=="function" then
+      local ok,value=pcall(api.selected,context)
+      if ok and value==false then return nil,"stadium-models-off" end
+    end
+    return api,"stadium:legacy-selected",context,stadium.id
+  end
+  return nil,"information-model-provider-unavailable"
 end
 
 function GoldCompat.stadiumUiDexNumber(game,mon)
   local species=mon and (mon.species or mon.id)
-  local def=species and game and game.data and game.data.pokemon
-    and game.data.pokemon[species]
-  local dex=def and tonumber(def.dex)
-  if not dex then return nil end
-  return math.floor(dex)
+  local defs=game and game.data and game.data.pokemon
+  if not (defs and species~=nil) then return nil end
+
+  local cache=GoldCompat.__stadiumUiDexCache[defs]
+  if not cache then
+    cache={}
+    GoldCompat.__stadiumUiDexCache[defs]=cache
+  end
+  local speciesKey=tostring(species)
+  local cached=cache[speciesKey]
+  if cached~=nil then return cached~=false and cached or nil end
+
+  local def=defs[species]
+  local dex=def and tonumber(def.dex or def.index or def.number)
+  if not dex and tonumber(species) then dex=tonumber(species) end
+  -- Some Gen I adapters preserve the species key but hand Summary a lightweight
+  -- wrapper. Resolve by definition id/name once, then memoize the answer. The
+  -- old path could rescan the entire species table every render frame.
+  if not dex then
+    local wanted=speciesKey:upper()
+    for _,candidate in pairs(defs) do
+      if type(candidate)=="table" then
+        local cid=tostring(candidate.id or ""):upper()
+        local cname=tostring(candidate.name or ""):upper()
+        if cid==wanted or cname==wanted then
+          dex=tonumber(candidate.dex or candidate.index or candidate.number)
+          if dex then break end
+        end
+      end
+    end
+  end
+  if dex then dex=math.floor(dex) end
+  cache[speciesKey]=dex or false
+  return dex
 end
 
 function GoldCompat.stadiumUiVariant(mon)
-  if mon and (mon.shiny==true or mon.isShiny==true) then return "shiny" end
-  local dvs=mon and mon.dvs
-  if type(dvs)=="table" then
-    local okStats,Stats=pcall(require,"src.pokemon.Stats")
-    if okStats and Stats and type(Stats.isShiny)=="function" then
-      local ok,value=pcall(Stats.isShiny,dvs)
-      if ok and value then return "shiny" end
-    end
-  end
-  return "normal"
+  return GoldCompat.monIsShiny(mon) and "shiny" or "normal"
+end
+
+function GoldCompat.stadiumUiMonKey(mon)
+  if type(mon)~="table" then return tostring(mon or "?") end
+  -- Gen I Summary adapters may rebuild lightweight Pokemon wrapper tables while
+  -- the page is open. Object identity is therefore not a valid model-cache key.
+  -- Species + shiny variant are the complete visual identity for CBE showroom
+  -- actors; HP, moves, nickname and other live data remain rendered by the UI.
+  local species=mon.species or mon.id or mon.dex or mon.number or mon.index or "?"
+  return tostring(species)..":"..GoldCompat.stadiumUiVariant(mon)
 end
 
 function GoldCompat.stadiumUiMatMul(a,b)
@@ -12453,130 +13632,402 @@ function GoldCompat.stadiumUiLookAt(eye,target)
     0,0,0,1}
 end
 
-function GoldCompat.stadiumUiViewProjection(actor,width,height)
-  local modelH=math.max(1,tonumber(actor and actor.worldHeight
-    and actor:worldHeight()) or 32)
-  local radius=math.max(1,tonumber(actor and actor.worldRadius
-    and actor:worldRadius()) or modelH*0.35)
+function GoldCompat.stadiumUiActorMetric(actor,method,fallback)
+  local target=actor
+  if not (target and type(target[method])=="function") then
+    target=actor and actor.mon
+  end
+  if target and type(target[method])=="function" then
+    local ok,value=pcall(target[method],target)
+    if ok and tonumber(value) then return tonumber(value) end
+  end
+  return fallback
+end
+
+function GoldCompat.stadiumUiActorBounds(actor)
+  local scale=tonumber(actor and actor.worldScale) or 1
+  local scene=actor and actor.scene
+  local b=scene and scene.bounds
+  local mn,mx=b and b.min,b and b.max
+  if type(mn)=="table" and type(mx)=="table" then
+    local h=math.abs((tonumber(mx[2]) or 0)-(tonumber(mn[2]) or 0))*scale
+    local rx=math.abs((tonumber(mx[1]) or 0)-(tonumber(mn[1]) or 0))*scale*0.5
+    local rz=math.abs((tonumber(mx[3]) or 0)-(tonumber(mn[3]) or 0))*scale*0.5
+    if h>0.01 then return h,math.max(rx,rz,0.5) end
+  end
+  local rawH=tonumber(actor and actor.height)
+  if rawH and rawH>0 then return rawH*scale,math.max(0.5,rawH*scale*0.35) end
+  return 16,5.6
+end
+
+function GoldCompat.updateStadiumUiInteraction(entry,x,y,w,h)
+  if not entry then return end
+  local function inside(px,py)
+    return px>=x and py>=y and px<=x+w and py<=y+h
+  end
+
+  -- LOVE's mouse/touch query functions are read-only and stable. This runs on
+  -- every information-viewer frame, so avoid wrapping each individual query in
+  -- pcall; drawStadiumUiModel itself is already protected by its caller.
+  local mouse=love and love.mouse
+  if mouse and type(mouse.getPosition)=="function" and type(mouse.isDown)=="function" then
+    local mx,my=mouse.getPosition()
+    local left,right,middle=mouse.isDown(1),mouse.isDown(2),mouse.isDown(3)
+    if entry.dragButton==1 and not left then entry.dragButton=nil end
+    if entry.dragButton==2 and not right then entry.dragButton=nil end
+    if not entry.dragButton and inside(mx,my) then
+      if left then entry.dragButton=1;entry.lastMouseX=mx;entry.lastMouseY=my
+      elseif right then entry.dragButton=2;entry.lastMouseX=mx;entry.lastMouseY=my end
+    end
+    if entry.dragButton then
+      local dx=mx-(entry.lastMouseX or mx)
+      local dy=my-(entry.lastMouseY or my)
+      entry.lastMouseX,entry.lastMouseY=mx,my
+      if entry.dragButton==1 then
+        entry.orbitYaw=(entry.orbitYaw or 0)+dx*0.012
+        entry.orbitPitch=math.max(-0.48,math.min(0.48,(entry.orbitPitch or 0)+dy*0.006))
+      elseif entry.dragButton==2 then
+        entry.zoom=math.max(0.62,math.min(1.70,(entry.zoom or 1)*math.exp(-dy*0.010)))
+      end
+    end
+    if inside(mx,my) and middle and not entry.middleWasDown then
+      entry.orbitYaw,entry.orbitPitch,entry.zoom=0,0,1
+    end
+    entry.middleWasDown=middle
+  end
+
+  -- One-finger touch drag uses the same showroom orbit and remains scoped to
+  -- the model pod so surrounding menu navigation keeps native touch ownership.
+  local touch=love and love.touch
+  if touch and type(touch.getTouches)=="function" and type(touch.getPosition)=="function" then
+    local ids=touch.getTouches() or {}
+    local active=false
+    for _,id in ipairs(ids) do
+      if entry.touchId==nil or entry.touchId==id then
+        local tx,ty=touch.getPosition(id)
+        if entry.touchId==id or inside(tx,ty) then
+          if entry.touchId==nil then
+            entry.touchId=id;entry.lastTouchX=tx;entry.lastTouchY=ty
+          else
+            local dx=tx-(entry.lastTouchX or tx)
+            local dy=ty-(entry.lastTouchY or ty)
+            entry.orbitYaw=(entry.orbitYaw or 0)+dx*0.012
+            entry.orbitPitch=math.max(-0.48,math.min(0.48,(entry.orbitPitch or 0)+dy*0.006))
+            entry.lastTouchX,entry.lastTouchY=tx,ty
+          end
+          active=true
+          break
+        end
+      end
+    end
+    if entry.touchId and not active then
+      entry.touchId=nil;entry.lastTouchX=nil;entry.lastTouchY=nil
+    end
+  end
+end
+
+function GoldCompat.stadiumUiViewProjection(actor,width,height,entry)
+  local zoom=math.max(0.62,math.min(1.70,tonumber(entry and entry.zoom) or 1))
+  local pitch=math.max(-0.48,math.min(0.48,tonumber(entry and entry.orbitPitch) or 0))
+  local cache=entry and entry.viewProjectionCache
+  if cache and cache.actor==actor and cache.width==width and cache.height==height
+      and cache.zoom==zoom and cache.pitch==pitch then
+    return cache.vp,cache.eye
+  end
+
+  local fallbackH,fallbackRadius=GoldCompat.stadiumUiActorBounds(actor)
+  local modelH=math.max(1,GoldCompat.stadiumUiActorMetric(actor,"worldHeight",fallbackH))
+  local radius=math.max(0.5,GoldCompat.stadiumUiActorMetric(actor,"worldRadius",fallbackRadius))
   local aspect=math.max(0.2,width/math.max(1,height))
   local frameH=math.max(modelH*1.16,(radius*2.35)/aspect)
   local fov=math.rad(28)
-  local distance=(frameH*0.5)/math.tan(fov*0.5)
+  local distance=((frameH*0.5)/math.tan(fov*0.5))/zoom
   local focus={0,modelH*0.48,0}
-  local eye={radius*0.30,modelH*0.53,distance}
+  local eye={radius*0.26,focus[2]+math.sin(pitch)*distance,math.cos(pitch)*distance}
   local projection=GoldCompat.stadiumUiPerspective(
     fov,aspect,math.max(0.1,distance*0.02),distance*5)
-  -- Stadium's public renderer follows the battle host's screen-Y convention.
   projection=GoldCompat.stadiumUiMatMul(
     {1,0,0,0, 0,-1,0,0, 0,0,1,0, 0,0,0,1},projection)
-  return GoldCompat.stadiumUiMatMul(
+  local vp=GoldCompat.stadiumUiMatMul(
     projection,GoldCompat.stadiumUiLookAt(eye,focus))
+  if entry then
+    entry.viewProjectionCache={actor=actor,width=width,height=height,zoom=zoom,
+      pitch=pitch,vp=vp,eye=eye}
+  end
+  return vp,eye
 end
 
 function GoldCompat.drawStadiumUiModel(game,mon,x,y,w,h,kind)
-  if kind~="summary" and kind~="dex" then return false end
+  if kind~="summary" and kind~="pokedex" then return false end
   if not (game and mon and love and love.graphics) then return false end
 
-  local models,exports=GoldCompat.stadiumUiModelService(game)
-  if not models then
-    GoldCompat.releaseStadiumUiActor(kind)
-    return false
-  end
-
-  local dex=GoldCompat.stadiumUiDexNumber(game,mon)
-  local maxSpecies=tonumber(models.speciesCount) or 0
-  if not dex or dex<1 or (maxSpecies>0 and dex>maxSpecies) then
-    GoldCompat.releaseStadiumUiActor(kind)
-    return false
-  end
-
-  local source=models.SELECTED or "selected"
-  local availableOk,available=pcall(models.available,source,dex)
-  if not (availableOk and available) then
-    GoldCompat.releaseStadiumUiActor(kind)
-    return false
-  end
-
-  local sourceToken=source
-  local sources=exports and exports.modelSources
-  if type(sources)=="table" and type(sources.selectedId)=="function" then
-    local tokenOk,value=pcall(sources.selectedId)
-    if tokenOk and value then sourceToken=tostring(value) end
-  end
-  local variant=GoldCompat.stadiumUiVariant(mon)
   local slots=GoldCompat.__stadiumUiActors
   local entry=slots[kind]
-  if entry and (entry.dex~=dex or entry.variant~=variant
-      or entry.sourceToken~=sourceToken or entry.models~=models) then
-    GoldCompat.releaseStadiumUiActor(kind)
-    entry=nil
+  local visualKey=GoldCompat.stadiumUiMonKey(mon)
+  local now=GoldCompat.stadiumUiClock()
+  local providerEpoch=GoldCompat.__presentationProviderEpoch or 0
+  local api,providerId,context,dex,variant,modelKey,source
+
+  -- HOT RESIDENT PATH ------------------------------------------------------
+  -- Once this surface already owns the exact species/variant, do not rediscover
+  -- CBE/Stadium/third-party providers, call mod.find, rebuild an information
+  -- context, or resolve the species number every display frame. Provider/mod
+  -- option changes bump presentationProviderEpoch and force one revalidation.
+  if entry and entry.actor and entry.api and entry.visualKey==visualKey
+      and entry.providerEpoch==providerEpoch then
+    api=entry.api
+    providerId=entry.providerId
+    context=entry.context
+    dex=entry.dex
+    variant=entry.variant
+    modelKey=entry.modelKey
+    source=entry.source or api.SELECTED or "selected"
+    entry.monRef=mon
+    entry.lastUsed=now
+    local battler=context and context.sides and context.sides.player
+      and context.sides.player.battler
+    if type(battler)=="table" then battler.mon=mon end
+  else
+    api,providerId,context=GoldCompat.cbeInformationModelService(game,mon,kind)
+    if not api then
+      if entry then GoldCompat.releaseStadiumUiActor(kind) end
+      return false
+    end
+
+    dex=GoldCompat.stadiumUiDexNumber(game,mon)
+    if not dex or dex<1 then return false end
+    variant=GoldCompat.stadiumUiVariant(mon)
+    local providerKey=tostring(providerId or "portable-actors")
+    modelKey=providerKey.."|"..visualKey
+    source=api.SELECTED or "selected"
+
+    -- Exact actor still active; this path is normally reached only after a
+    -- provider/options epoch changed. Revalidate ownership without rebuilding.
+    if entry and entry.modelKey==modelKey and entry.actor and entry.api==api then
+      entry.monRef=mon
+      entry.providerEpoch=providerEpoch
+      entry.providerId=providerId
+      entry.context=context or entry.context
+      entry.source=source
+      entry.lastUsed=now
+      context=entry.context
+      local battler=context and context.sides and context.sides.player
+        and context.sides.player.battler
+      if type(battler)=="table" then battler.mon=mon end
+    else
+      if (kind=="pokedex" or kind=="summary") and entry then
+        GoldCompat.stadiumUiRememberActor(kind,entry)
+        slots[kind]=nil
+        entry=nil
+      elseif entry then
+        GoldCompat.releaseStadiumUiActor(kind)
+        entry=nil
+      end
+
+      -- Cache keys include provider identity, so changing from CBE -> Stadium
+      -- (or vice versa) can never resurrect an actor from the old source.
+      entry=GoldCompat.stadiumUiCachedActor(kind,modelKey)
+      if entry and entry.api==api then
+        slots[kind]=entry
+        entry.monRef=mon
+        entry.providerEpoch=providerEpoch
+        entry.providerId=providerId
+        entry.source=source
+        entry.context=context or entry.context
+        GoldCompat.__stadiumUiPending[kind]=nil
+        context=entry.context
+        local battler=context and context.sides and context.sides.player
+          and context.sides.player.battler
+        if type(battler)=="table" then battler.mon=mon end
+      else
+        entry=nil
+        local peek
+        if type(api.peek)=="function" then
+          local ok,value=pcall(api.peek,source,dex,variant)
+          if ok and type(value)=="table" then peek=value end
+        end
+
+        -- Only debounce a genuinely cold, not-yet-prepared source. Warm or
+        -- provider-cached assets acquire immediately and never flash 2D art.
+        if kind=="pokedex" and peek and peek.cached==false and peek.resident~=true
+            and not GoldCompat.stadiumUiSelectionSettled(kind,modelKey) then
+          return "pending"
+        end
+
+        local battler={mon=mon}
+        if type(context)=="table" then
+          context.sides=context.sides or {}
+          context.sides.player=context.sides.player or {}
+          context.sides.player.battler=battler
+        end
+
+        -- acquire() is the portable-actor authority. Calling available() first
+        -- made cache-backed CBE actors perform the same cache/filesystem probe
+        -- twice on every cold menu acquisition, which is especially expensive
+        -- on the Gen I path. Providers still fail open by returning nil here.
+        local acquireOk,actor=false,nil
+        if peek and peek.resident==true and type(api.acquireCached)=="function" then
+          acquireOk,actor=pcall(api.acquireCached,source,dex,variant,{
+            side="player",context=context,battler=battler,
+          })
+        end
+        if not (acquireOk and actor) then
+          acquireOk,actor=pcall(api.acquire,source,dex,variant,{
+            side="player",context=context,battler=battler,
+          })
+        end
+        if not (acquireOk and actor) then return false end
+
+        entry={actor=actor,dex=dex,variant=variant,modelKey=modelKey,
+          visualKey=visualKey,monRef=mon,providerId=providerId,api=api,
+          providerEpoch=providerEpoch,source=source,context=context,
+          canvas=nil,canvasW=0,canvasH=0,canvasReady=false,
+          lastActorUpdate=nil,lastRenderTime=nil,
+          orbitYaw=0,orbitPitch=0,zoom=1,dragButton=nil,
+          lastMouseX=nil,lastMouseY=nil,lastUsed=now}
+        slots[kind]=entry
+        GoldCompat.__stadiumUiPending[kind]=nil
+        if kind=="pokedex" then GoldCompat.stadiumUiRememberActor(kind,entry) end
+
+        -- Portable battle actors may start at spawnScale=0. Information
+        -- surfaces have no send-out lifecycle, so park them at full-size idle.
+        if type(actor.spawn)=="function" then pcall(actor.spawn,actor,1) end
+        if type(actor.idle)=="function" then pcall(actor.idle,actor)
+        elseif type(actor.play)=="function" then pcall(actor.play,actor,"idle") end
+      end
+    end
   end
 
-  if not entry then
-    local acquireOk,actor=pcall(models.acquire,source,dex,variant,{side="external"})
-    if not (acquireOk and actor) then return false end
-    entry={actor=actor,dex=dex,variant=variant,sourceToken=sourceToken,
-      models=models,lastTime=nil,canvas=nil,canvasW=0,canvasH=0}
-    slots[kind]=entry
-    if type(actor.play)=="function" then pcall(actor.play,actor,"idle") end
-  end
+  local actor=entry and entry.actor
+  if not actor then return "pending" end
 
-  local actor=entry.actor
-  if not actor then return false end
-  local now=(love.timer and love.timer.getTime and love.timer.getTime()) or 0
-  local dt=entry.lastTime and math.max(0,math.min(0.05,now-entry.lastTime)) or 0
-  entry.lastTime=now
-  if type(actor.update)=="function" then pcall(actor.update,actor,dt) end
+  local oldYaw,oldPitch,oldZoom=entry.orbitYaw,entry.orbitPitch,entry.zoom
+  GoldCompat.updateStadiumUiInteraction(entry,x,y,w,h)
+  local interactionDirty=oldYaw~=entry.orbitYaw or oldPitch~=entry.orbitPitch
+    or oldZoom~=entry.zoom
+  entry.lastUsed=now
 
   local G=love.graphics
-  local px1,py1=x,y
-  local px2,py2=x+w,y+h
-  if type(G.transformPoint)=="function" then
-    local ok1,a,b=pcall(G.transformPoint,x,y)
-    local ok2,c,d=pcall(G.transformPoint,x+w,y+h)
-    if ok1 and ok2 then px1,py1,px2,py2=a,b,c,d end
+  -- Gen I information surfaces are frequently displayed on mobile and paid the
+  -- full physical pod resolution even though the 3D specimen is only a menu
+  -- preview. Keep battle rendering untouched; only this private UI target is
+  -- downsampled. The cached canvas is then scaled back into the authored pod.
+  local hostOS=nil
+  if love.system and type(love.system.getOS)=="function" then
+    local okOS,value=pcall(love.system.getOS)
+    if okOS then hostOS=tostring(value or "") end
   end
-  local canvasW=math.max(64,math.min(512,math.floor(math.abs(px2-px1)+0.5)))
-  local canvasH=math.max(64,math.min(512,math.floor(math.abs(py2-py1)+0.5)))
+  local android=hostOS=="Android"
+  local gen1=(GoldCompat.generation=="gen1")
+  local resolutionScale=gen1 and (android and 0.52 or 0.72) or 1.0
+  local maxCanvas=gen1 and (android and 192 or 288) or 512
+  local minCanvas=gen1 and 72 or 64
+  local canvasW=math.max(minCanvas,math.min(maxCanvas,
+    math.floor(math.abs(w)*resolutionScale+0.5)))
+  local canvasH=math.max(minCanvas,math.min(maxCanvas,
+    math.floor(math.abs(h)*resolutionScale+0.5)))
+  local canvasDirty=false
   if not entry.canvas or entry.canvasW~=canvasW or entry.canvasH~=canvasH then
     local canvasOk,canvas=pcall(G.newCanvas,canvasW,canvasH,{dpiscale=1})
     if not (canvasOk and canvas) then return false end
+    if canvas.setFilter then pcall(canvas.setFilter,canvas,"linear","linear") end
+    if entry.canvas and entry.canvas.release then pcall(entry.canvas.release,entry.canvas) end
     entry.canvas,entry.canvasW,entry.canvasH=canvas,canvasW,canvasH
+    entry.canvasReady=false
+    entry.viewProjectionCache=nil
+    canvasDirty=true
   end
 
-  local priorCanvas=G.getCanvas and G.getCanvas() or nil
-  G.push("all")
-  local renderOk=pcall(function()
-    G.setCanvas({entry.canvas,depth=true})
-    G.origin()
-    G.clear(0,0,0,0,true,true)
-    local vp=GoldCompat.stadiumUiViewProjection(actor,canvasW,canvasH)
-    local matrix=actor.matrix and actor:matrix(0,0,0,0,1) or nil
-    if not matrix then error("Stadium UI model matrix unavailable") end
-    local okDraw,drew=models.draw(actor,vp,matrix,0)
-    if not okDraw or drew==false then
-      error("Stadium UI model draw failed: "..tostring(drew))
-    end
-  end)
-  if priorCanvas then G.setCanvas(priorCanvas) else G.setCanvas() end
-  G.pop()
-  if not renderOk then return false end
+  -- Keep interaction responsive, but an idle menu model does not need to run at
+  -- battle/monitor refresh rate. This is deliberately stricter on Gen I mobile,
+  -- where the UI model viewer was the dominant menu GPU cost.
+  local interacting=entry.dragButton~=nil or entry.touchId~=nil or interactionDirty
+  local renderHz=60
+  if gen1 then
+    if android then renderHz=interacting and 30 or 18
+    else renderHz=interacting and 45 or 24 end
+  end
+  local renderInterval=1/renderHz
+  local renderDue=canvasDirty or interactionDirty or not entry.canvasReady
+    or not entry.lastRenderTime or (now-entry.lastRenderTime)>=renderInterval
+
+  if renderDue then
+    local dt=entry.lastActorUpdate
+      and math.max(0,math.min(0.05,now-entry.lastActorUpdate)) or 0
+    entry.lastActorUpdate=now
+    if type(actor.update)=="function" then pcall(actor.update,actor,dt) end
+
+    local priorCanvas=G.getCanvas and G.getCanvas() or nil
+    G.push("all")
+    local renderOk=pcall(function()
+      G.setCanvas({entry.canvas,depth=true})
+      G.origin()
+      G.clear(0,0,0,0,true,true)
+      local vp,eye=GoldCompat.stadiumUiViewProjection(actor,canvasW,canvasH,entry)
+      local yaw=tonumber(entry.orbitYaw) or 0
+      local matrix=actor.matrix and actor:matrix(0,0,0,math.sin(yaw),math.cos(yaw)) or nil
+      if not matrix then error("information-model matrix unavailable") end
+      local built=type(actor.build)~="function" or actor:build()~=false
+      if not built then error("information-model build failed") end
+      local accepted,err=api.withRenderer(vp,function()
+        local drew=actor:draw(matrix,0)
+        if drew==false then error("information-model draw failed") end
+        return true
+      end,{eye=eye,width=canvasW,height=canvasH,context=entry.context})
+      if accepted==false then error(tostring(err or "information renderer declined")) end
+    end)
+    if priorCanvas then G.setCanvas(priorCanvas) else G.setCanvas() end
+    G.pop()
+    if not renderOk then return false end
+    entry.canvasReady=true
+    entry.lastRenderTime=now
+  end
 
   G.push("all")
+  G.origin()
   G.setColor(1,1,1,1)
   G.draw(entry.canvas,x,y,0,w/canvasW,h/canvasH)
   G.pop()
   return true
 end
 
-function GoldCompat.drawCleanResolvedPortrait(game,mon,x,y,w,h,kind)
-  -- Information surfaces prefer the active Stadium 3D model when the
-  -- Stadium provider is selected. Every failure falls through to the existing
-  -- resolved-sprite path, preserving Battle Arts, Crystal and custom packs.
-  local stadiumOk,stadiumDrew=pcall(
-    GoldCompat.drawStadiumUiModel,game,mon,x,y,w,h,kind)
-  if stadiumOk and stadiumDrew then return true end
+function GoldCompat.drawInformationPortrait(game,mon,x,y,w,h,modelKind,spriteKind)
+  -- Full information viewers share one fail-open contract: borrow the selected
+  -- provider's read-only 3D actor when available, otherwise preserve the exact
+  -- resolved 2D sprite path for that surface.
+  game=game or GoldCompat.game or (modRef and modRef.game)
+  local modelOk,modelDrew=pcall(
+    GoldCompat.drawStadiumUiModel,game,mon,x,y,w,h,modelKind)
+  if modelOk and modelDrew==true then return true end
+  -- `pending` means a 3D provider owns this surface but its cold asset is not
+  -- ready yet. Do not flash an unrelated 2D sprite into a model viewer; leave
+  -- the pod clean for this transient frame. Warm/provider-cached assets never
+  -- take this branch.
+  if modelOk and modelDrew=="pending" then return true end
+  return GoldCompat.drawCleanResolvedPortrait(game,mon,x,y,w,h,spriteKind)
+end
 
+function GoldCompat.drawStatsInformationPortrait(game,mon,x,y,w,h)
+  return GoldCompat.drawInformationPortrait(
+    game,mon,x,y,w,h,"summary","summary")
+end
+
+function GoldCompat.drawPokedexInformationPortrait(game,mon,x,y,w,h)
+  -- A dedicated actor slot keeps Pokédex orbit/zoom state independent from
+  -- Summary while sharing the active provider's prepared asset lifecycle.
+  return GoldCompat.drawInformationPortrait(
+    game,mon,x,y,w,h,"pokedex","dex")
+end
+
+function GoldCompat.drawCleanResolvedPortrait(game,mon,x,y,w,h,kind)
+  -- STRICT 2D PORTRAIT PATH.
+  --
+  -- This helper is used by Party cards/detail panels, PC surfaces, fallback Dex
+  -- rendering and other portrait-sized UI. It never substitutes a CBE 3D actor
+  -- on its own; information viewers opt in through dedicated helpers. Several
+  -- Party callers pass
+  -- kind="summary" only because they want the front-facing sprite asset; that
+  -- string is not permission to turn a Party portrait into a model viewer.
   local ok,image,meta=pcall(spritePortraitResolver.resolve,game,mon,kind)
   if not (ok and image) then return false end
   image,meta=GoldCompat.prepareCleanResolvedPortrait(image,meta)
@@ -12612,8 +14063,13 @@ function GoldCompat.drawCleanResolvedPortrait(game,mon,x,y,w,h,kind)
   G.setScissor(clipX,clipY,clipW,clipH)
   G.draw(image,dx,dy,0,scale,scale)
   if type(meta)=="table" and meta.trueColor then
-    local okPalette,PaletteFX=pcall(require,"src.render.PaletteFX")
-    if okPalette and PaletteFX and type(PaletteFX.markTrueColor)=="function" then
+    local PaletteFX=GoldCompat.__paletteFxModule
+    if PaletteFX==nil then
+      local okPalette,value=pcall(require,"src.render.PaletteFX")
+      PaletteFX=(okPalette and value) or false
+      GoldCompat.__paletteFxModule=PaletteFX
+    end
+    if PaletteFX and type(PaletteFX.markTrueColor)=="function" then
       local mx=math.max(x,dx)
       local my=math.max(y,dy)
       local mr=math.min(x+w,dx+iw*scale)
@@ -13397,7 +14853,7 @@ function GoldCompat.drawLocationBanner(name,alpha)
   local uiScale=clamp(math.min(sw/1280,sh/720),0.72,1.75)
   local textSize=clamp(math.floor(22*uiScale+0.5),15,34)
   local textFont=font(textSize*UI_TEXT_SCALE*GoldCompat.userTextScale())
-  local textW=textFont and textFont:getWidth(tostring(name)) or (#tostring(name)*textSize*0.55)
+  local textW=textFont and GoldCompat.measureFontWidth(textFont,name) or (#tostring(name)*textSize*0.55)
   local padX=math.floor(34*uiScale+0.5)
   local w=clamp(math.floor(textW+padX*2+0.5),math.floor(260*uiScale),math.floor(720*uiScale))
   w=math.min(w,sw-math.floor(24*uiScale))
@@ -13857,62 +15313,9 @@ function GoldCompat.drawGoldPokedex(self,winW,winH)
         },{__index=self.game.save})
       },{__index=self.game})
 
-      -- Draw the established Gen 1 entry card, then replace its description
-      -- region with Gold's real two-page dex text.
+      -- Strategy Memo owns the complete dossier surface, including Gold's
+      -- joined source text and controls. No legacy repaint is needed afterward.
       DexUI.drawEntry(proxy,{def=def,forceOwned=row.caught==true})
-      -- Strategy Memo owns the complete dossier surface. Gold's old adapter
-      -- used to repaint a cartridge-style description/footer over this point.
-      do return end
-
-      local ox,oy,sc=safeFullCanvas()
-      -- Our UI has one complete DATA page. Gold's two cartridge-sized text
-      -- chunks are joined and rewrapped for the larger modern card.
-      local raw=table.concat({
-        tostring(dexEntry.text or ""),
-        tostring(dexEntry.text2 or "")
-      }," ")
-      local clean=GoldCompat.cleanWrappedText(raw)
-
-      local G=love.graphics
-      G.push("all")
-      G.translate(ox,oy)
-      G.scale(sc,sc)
-      G.setColor(0.99,0.985,0.95,1)
-
-      -- The shared entry card already printed a bare ENTRY label. Clear the
-      -- complete description/label region before drawing Gold's page counter
-      -- so ENTRY never appears double-layered.
-      G.rectangle("fill",10,75,138,48)
-      G.pop()
-
-      finalText("ENTRY",12,78,3.2,{0.38,0.38,0.35,1},ox,oy,sc)
-
-      local entrySize=3.55
-      local f=font(entrySize*UI_TEXT_SCALE*GoldCompat.userTextScale())
-      local _,wrapped=f:getWrap(clean,132)
-      for i=1,math.min(5,#wrapped) do
-        finalText(wrapped[i],12,87+(i-1)*7.4,entrySize,
-          {0.08,0.08,0.08,1},ox,oy,sc,"left",132)
-      end
-
-      -- DexUI's shared detail renderer already drew its own footer controls.
-      -- Erase that footer here before painting the Gold DATA controls; without
-      -- this the two legends occupy the exact same pixels and look "bold" or
-      -- scrambled regardless of text scaling.
-      G.push("all")
-      G.translate(ox,oy)
-      G.scale(sc,sc)
-      G.setColor(0.08,0.08,0.08,1)
-      G.rectangle("fill",4,132,152,8)
-      G.pop()
-
-      local backLabel="B: BACK"
-      local backSize=2.05
-      local backX=151-finalTextWidth(backLabel,backSize,sc)
-      safeFooterText("A: CATCH LOCATIONS",9,134,2.05,
-        {0.96,0.95,0.90,1},ox,oy,sc,104)
-      finalText(backLabel,backX,134,backSize,
-        {0.96,0.95,0.90,1},ox,oy,sc)
       return
     end
   end
@@ -14172,8 +15575,8 @@ function GoldCompat.drawGoldSummaryIdentity(summary,ox,oy,sc)
   local G=love.graphics
   G.push("all")
   G.origin()
-  pcall(GoldCompat.drawCleanResolvedPortrait,summary.game,mon,
-    ox+13*sc,oy+54*sc,47*sc,39*sc,"summary")
+  pcall(GoldCompat.drawStatsInformationPortrait,summary.game,mon,
+    ox+13*sc,oy+54*sc,47*sc,39*sc)
   G.pop()
 
   local gender=GoldCompat.genderSymbol(mon)
@@ -14990,8 +16393,8 @@ function GoldCompat.drawColosseumStatusPage(game,summary,mon,def,gen2)
   GoldCompat.drawColosseumSummaryTabs(1,ox,oy,sc)
 
   G.push("all"); G.origin()
-  pcall(GoldCompat.drawCleanResolvedPortrait,game,mon,
-    ox+12*sc,oy+27*sc,45*sc,43*sc,"summary")
+  pcall(GoldCompat.drawStatsInformationPortrait,game,mon,
+    ox+12*sc,oy+27*sc,45*sc,43*sc)
   G.pop()
   local name=tostring(mon.nickname or mon.name or def.name or mon.species or "POKéMON")
   finalText(name,11,76,3.0,white,ox,oy,sc,"left",35)
@@ -15043,6 +16446,121 @@ function GoldCompat.drawColosseumStatusPage(game,summary,mon,def,gen2)
   finalText("B: BACK",133,134,1.9,muted,ox,oy,sc,"right",18)
 end
 
+
+function GoldCompat.drawColosseumEggSummary(summary)
+  -- A deliberately species-agnostic Egg presentation. Gold protects the
+  -- contents of an unhatched Egg; this screen upgrades the presentation without
+  -- exposing species, types, moves, stats, DVs, OT data or the exact hatch timer.
+  if GoldCompat.__stadiumUiActors and GoldCompat.__stadiumUiActors.summary
+      and type(GoldCompat.releaseStadiumUiActor)=="function" then
+    GoldCompat.releaseStadiumUiActor("summary")
+  end
+
+  local G=love.graphics
+  local ox,oy,sc=safeFullCanvas()
+  local white={0.97,0.99,0.96,1}
+  local muted={0.62,0.78,0.74,1}
+  local lime={0.48,1.00,0.63,1}
+  local gold={1.00,0.80,0.27,1}
+  local rim={0.27,0.55,0.52,0.96}
+  local glass={0.010,0.035,0.038,0.91}
+  local now=(love.timer and love.timer.getTime and love.timer.getTime()) or 0
+  local bob=math.sin(now*1.75)*1.0
+  local glow=0.5+0.5*math.sin(now*1.35)
+  local cycles=summary and summary.mon and tonumber(summary.mon.eggCycles)
+  local incubation="INCUBATING"
+  local status="UNHATCHED"
+  if cycles then
+    if cycles<=5 then incubation,status="MOVEMENT DETECTED","HATCHING VERY SOON"
+    elseif cycles<=10 then incubation,status="VERY ACTIVE","GETTING CLOSE"
+    elseif cycles<=40 then incubation,status="DEVELOPING","NEEDS MORE TIME"
+    else incubation,status="EARLY INCUBATION","A LONG WAY TO GO" end
+  end
+
+  local function eggPolygon(cx,cy,rx,ry)
+    local pts={}
+    local steps=40
+    for i=0,steps-1 do
+      local t=(i/steps)*math.pi*2
+      local sy=math.sin(t)
+      -- Narrower crown, slightly fuller base: a true egg silhouette rather than
+      -- a plain ellipse, built only from portable LÖVE primitives.
+      local width=0.90+0.13*sy
+      pts[#pts+1]=cx+math.cos(t)*rx*width
+      pts[#pts+1]=cy+sy*ry
+    end
+    return pts
+  end
+
+  G.push("all")
+  G.translate(ox,oy); G.scale(sc,sc)
+  G.setColor(0.004,0.018,0.020,0.34); G.rectangle("fill",0,0,160,144)
+  G.setColor(glass); roundedRect("fill",3,3,154,128,5)
+  G.setColor(rim); roundedRect("line",3,3,154,128,5)
+  G.setColor(0.012,0.032,0.035,0.94); roundedRect("fill",6,6,148,12,4)
+
+  -- Left incubation pod.
+  G.setColor(0.025,0.075,0.078,0.92); roundedRect("fill",7,22,61,99,5)
+  G.setColor(rim); roundedRect("line",7,22,61,99,5)
+  G.setColor(0.020,0.045,0.048,0.96); roundedRect("fill",11,27,53,70,4)
+  G.setColor(0.11,0.32,0.31,0.72); roundedRect("line",11,27,53,70,4)
+  -- Showroom grid and soft scanner rings.
+  G.setColor(0.09,0.24,0.23,0.38)
+  for gx=16,60,8 do G.line(gx,31,gx,92) end
+  for gy=33,91,8 do G.line(14,gy,61,gy) end
+  G.setColor(0.20,0.75,0.63,0.16+0.12*glow)
+  G.ellipse("line",37.5,65+bob,22+glow*2,31+glow*2)
+  G.ellipse("line",37.5,65+bob,18+glow*1.5,27+glow*1.5)
+  G.setColor(0,0,0,0.28); G.ellipse("fill",37.5,88,17,4)
+
+  -- Egg shell. Reuse one sampled silhouette for fill + outline.
+  local shell=eggPolygon(37.5,62+bob,15.5,24.5)
+  G.setColor(0.92,0.94,0.88,1)
+  G.polygon("fill",shell)
+  G.setColor(0.45,0.69,0.62,0.92)
+  G.polygon("line",shell)
+  G.setColor(0.58,0.83,0.68,0.88)
+  G.ellipse("fill",31.5,55+bob,4.2,3.0)
+  G.ellipse("fill",42.5,67+bob,4.8,3.4)
+  G.ellipse("fill",35.0,76+bob,3.2,2.3)
+  G.setColor(1,1,1,0.54)
+  G.ellipse("fill",32.2,46+bob,4.3,6.8)
+
+  -- Right information panel.
+  G.setColor(0.012,0.032,0.035,0.94); roundedRect("fill",72,22,82,99,5)
+  G.setColor(rim); roundedRect("line",72,22,82,99,5)
+  G.setColor(0.055,0.15,0.15,0.95); roundedRect("fill",77,29,72,16,3)
+  G.setColor(0.16,0.42,0.38,0.92); roundedRect("line",77,29,72,16,3)
+  G.setColor(0.028,0.075,0.075,0.92); roundedRect("fill",77,50,72,18,3)
+  G.setColor(0.16,0.42,0.38,0.80); roundedRect("line",77,50,72,18,3)
+  G.setColor(0.028,0.075,0.075,0.92); roundedRect("fill",77,73,72,41,3)
+  G.setColor(0.16,0.42,0.38,0.80); roundedRect("line",77,73,72,41,3)
+
+  -- Scanner pulse line through the pod.
+  local scanY=34+((now*13)%56)
+  G.setColor(0.34,1.00,0.67,0.12+0.16*glow); G.rectangle("fill",13,scanY,49,0.8)
+
+  -- Footer.
+  G.setColor(0.008,0.027,0.030,0.97); roundedRect("fill",5,133,150,8,2)
+  G.setColor(0.18,0.47,0.44,0.88); roundedRect("line",5,133,150,8,2)
+  G.pop()
+
+  finalText("EGG INFORMATION",9,9,3.15,white,ox,oy,sc)
+  finalText("UNHATCHED EGG",80,32,3.25,white,ox,oy,sc,"left",65)
+  finalText(incubation,80,39,2.05,lime,ox,oy,sc,"left",63)
+  finalText("STATUS",80,53,1.8,muted,ox,oy,sc)
+  finalText(status,80,59,2.05,gold,ox,oy,sc,"left",65)
+  finalText("CARE",80,76,1.8,muted,ox,oy,sc)
+  finalText("KEEP THIS EGG WITH",80,83,1.95,white,ox,oy,sc,"left",65)
+  finalText("YOUR PARTY AS YOU",80,90,1.95,white,ox,oy,sc,"left",65)
+  finalText("TRAVEL. SOMETHING",80,97,1.95,white,ox,oy,sc,"left",65)
+  finalText("MAY HATCH FROM IT.",80,104,1.95,white,ox,oy,sc,"left",65)
+  finalText("SPECIES / TYPE / MOVES / STATS LOCKED UNTIL HATCHING",12,111,1.30,muted,ox,oy,sc,"left",52)
+  finalText("UNHATCHED POKéMON EGG",9,135,1.55,muted,ox,oy,sc)
+  finalText("B: BACK",135,135,1.85,white,ox,oy,sc,"right",17)
+  return true
+end
+
 function GoldCompat.drawColosseumSummary(game,summary)
   if not (summary and summary.mon) then return end
   game=game or summary.game
@@ -15051,13 +16569,10 @@ function GoldCompat.drawColosseumSummary(game,summary)
   local def=defs[mon.species]
   if not def then return end
 
-  -- Preserve Gold's protected egg presentation instead of exposing hidden data.
-  if mon.isEgg and GoldCompat.generation=="gen2" then
-    local Summary=require("src.ui.gen2.SummaryMenu")
-    if Summary.__gen3uiOriginalDrawWidescreen then
-      return Summary.__gen3uiOriginalDrawWidescreen(summary,
-        love.graphics.getWidth(),love.graphics.getHeight())
-    end
+  -- Eggs now receive a dedicated Colosseum information card while preserving
+  -- Gold's protected-data rule.
+  if mon.isEgg then
+    return GoldCompat.drawColosseumEggSummary(summary)
   end
 
   local G=love.graphics
@@ -15135,8 +16650,8 @@ function GoldCompat.drawColosseumSummary(game,summary)
 
   G.push("all")
   G.origin()
-  pcall(GoldCompat.drawCleanResolvedPortrait,game,mon,
-    ox+10*sc,oy+28*sc,39*sc,42*sc,"summary")
+  pcall(GoldCompat.drawStatsInformationPortrait,game,mon,
+    ox+10*sc,oy+28*sc,39*sc,42*sc)
   G.pop()
 
   local name=tostring(mon.nickname or mon.name or def.name or mon.species or "POKéMON")
@@ -15385,13 +16900,10 @@ end
 function GoldCompat.drawGoldSummary(summary,winW,winH)
   if not (summary and summary.mon) then return end
 
-  -- Eggs keep their purpose-built native Gold summary screen; revealing the
-  -- hidden species/stats would violate Gold's own egg flow.
+  -- Custom protected Egg screen: presentation is upgraded, hidden contents are
+  -- still never exposed before hatching.
   if summary.mon.isEgg then
-    local Summary=require("src.ui.gen2.SummaryMenu")
-    if Summary.__gen3uiOriginalDrawWidescreen then
-      return Summary.__gen3uiOriginalDrawWidescreen(summary,winW,winH)
-    end
+    return GoldCompat.drawColosseumEggSummary(summary)
   end
 
   if featureEnabled("colosseumPokemonMenu") then
@@ -15489,21 +17001,8 @@ function GoldCompat.drawGoldPack(pack,winW,winH,embedded)
   for r=1,visible do
     local idx=first+r-1
     local yy=y+23+(r-1)*10
-    local row=rows[idx]
-    local isCancel=(idx>#rows and idx==(pack.index or 1))
-    local selected=idx==(pack.index or 1)
-
-    if selected then
+    if idx==(pack.index or 1) then
       drawColosseumRunoffSelection(x+6,yy-1,w-12,9)
-    end
-
-    if row then
-      local label=tostring(row.name or row.id or "")
-      G.setColor(selected and 1 or 0.06,selected and 1 or 0.06,
-                 selected and 1 or 0.06,1)
-      -- native final text is drawn outside transform below
-    elseif idx==#rows+1 then
-      -- CANCEL row
     end
   end
 
@@ -16062,7 +17561,7 @@ function GoldCompat.drawEvolutionFlow(flow,egg)
 
   local function speciesName(id)
     local def=game and game.data and game.data.pokemon and game.data.pokemon[id]
-    return tostring((def and def.name) or id or "POKÃ©MON")
+    return tostring((def and def.name) or id or "POKéMON")
   end
   local stageLabel
   if egg then
@@ -16145,6 +17644,42 @@ function GoldCompat.drawNamingFlow(flow,kind)
   if flow.monName and tostring(flow.monName)~="" then
     finalText(tostring(flow.monName),x+w-60,y+7,2.0,{0.56,0.76,0.72,1},
       ox,oy,sc,"right",50)
+  end
+
+  -- Gen I Oak naming first asks whether the player wants NEW NAME or one of
+  -- the cartridge presets. 2.1.1 incorrectly pushed a stock Menu underneath
+  -- this custom state, which left the vanilla chooser visible/interactive and
+  -- exposed the keyboard before NEW NAME was selected. Render and own that
+  -- chooser here instead; SafeIntroNaming does not enter character input until
+  -- the first row is explicitly confirmed. Player and rival use the same path.
+  if flow.phase=="choose" and type(flow.presets)=="table" and #flow.presets>0 then
+    local options={Strings("NEW NAME")}
+    for _,preset in ipairs(flow.presets) do options[#options+1]=tostring(preset) end
+    local selected=math.max(1,math.min(#options,tonumber(flow.choiceIndex) or 1))
+    local listX,listY,listW=x+14,y+26,w-28
+    local rowH=13
+    local listH=math.max(42,#options*rowH+8)
+    G.push("all"); G.translate(ox,oy); G.scale(sc,sc)
+    G.setColor(0.004,0.024,0.026,0.48)
+    roundedRect("fill",listX,listY,listW,listH,4)
+    G.setColor(0.18,0.43,0.42,1)
+    roundedRect("line",listX,listY,listW,listH,4)
+    G.pop()
+    finalText("SELECT A NAME",listX+7,listY+5,1.75,{0.56,0.78,0.73,1},
+      ox,oy,sc,"left",listW-14)
+    for i,label in ipairs(options) do
+      local yy=listY+13+(i-1)*rowH
+      local active=i==selected
+      G.push("all"); G.translate(ox,oy); G.scale(sc,sc)
+      if active then drawColosseumRunoffSelection(listX+5,yy-2,listW-10,9) end
+      G.pop()
+      finalText(tostring(label),listX+12,yy,2.55,
+        active and {0.98,1.00,0.98,1} or {0.68,0.84,0.79,1},
+        ox,oy,sc,"left",listW-24)
+    end
+    finalText("A SELECT",x+10,y+h-7,1.65,{0.50,0.70,0.66,1},ox,oy,sc,
+      "center",w-20)
+    return
   end
 
   -- Name strip. Empty positions remain visible as a subtle underline rail so
@@ -16391,7 +17926,7 @@ function GoldCompat.drawMoveDeleterFlow(flow)
     local def=flow.game and flow.game.data and flow.game.data.pokemon
       and flow.game.data.pokemon[mon.species]
     local name=mon.nickname or mon.name or (def and def.name) or mon.species
-    finalText(tostring(name or "POKÃ©MON"),x+12,y+56,2.25,
+    finalText(tostring(name or "POKéMON"),x+12,y+56,2.25,
       {0.74,0.91,0.84,1},ox,oy,sc,"center",w-24)
   end
 
@@ -16742,14 +18277,21 @@ function SafeIntroNaming.new(game,opts)
   local self=setmetatable({},SafeIntroNaming)
   self.game=game
   self.title=opts.title or Strings("YOUR NAME?")
-  self.presets=opts.presets
+  self.presets=type(opts.presets)=="table" and opts.presets or nil
   self.maxLen=math.max(1,tonumber(opts.maxLen) or 7)
   self.default=opts.default
   self.onDone=opts.onDone
   self.glyphs={}
   self.row,self.col=1,1
   self.lower=false
+  -- Intro naming has two native phases: choose NEW NAME vs a preset first,
+  -- then open character input only when NEW NAME wins. Keep both phases in
+  -- this one custom state so no stock Menu/NamingScreen can remain alive
+  -- behind the Colosseum presentation or keep receiving input underneath it.
+  self.phase=(self.presets and #self.presets>0) and "choose" or "input"
+  self.choiceIndex=1
   self.__colosseumFlowKind="naming"
+  self.__gen3uiBattleOverlay=true
   self.__colosseumIntroSafe=true
   self.screenId="NamingScreen"
   return self
@@ -16757,27 +18299,6 @@ end
 
 function SafeIntroNaming:grid()
   return self.lower and SAFE_INTRO_GRID_LOWER or SAFE_INTRO_GRID_UPPER
-end
-
-function SafeIntroNaming:enter()
-  if not (type(self.presets)=="table" and #self.presets>0) then return end
-  local items={{label=Strings("NEW NAME")}}
-  for _,preset in ipairs(self.presets) do
-    local value=tostring(preset)
-    items[#items+1]={
-      label=value,
-      onSelect=function()
-        -- Menu has already popped itself when this callback runs.
-        if self.game and self.game.stack then self.game.stack:pop() end
-        if self.onDone then self.onDone(value) end
-      end,
-    }
-  end
-  if self.game and self.game.stack then
-    self.game.stack:push(Menu.new(self.game,items,{
-      tx=4,ty=0,tw=12,th=#items*2+2,cancelable=false,
-    }))
-  end
 end
 
 function SafeIntroNaming:confirm()
@@ -16790,7 +18311,10 @@ function SafeIntroNaming:confirm()
     if data then require("src.core.Sound").play(data,"Press_AB") end
   end)
   if self.game and self.game.stack then self.game.stack:pop() end
-  if self.onDone then self.onDone(name) end
+  -- Keyboard/grid entry is the cartridge's custom-name branch.  The callback
+  -- needs this distinction because OakSpeech skips the preset slide-back delay
+  -- for a custom name after closing the held intro prompt.
+  if self.onDone then self.onDone(name,true) end
 end
 
 function SafeIntroNaming:jumpToEnd()
@@ -16800,6 +18324,36 @@ end
 function SafeIntroNaming:update(_dt)
   local input=self.game and self.game.input
   if not input then return end
+
+  if self.phase=="choose" then
+    local count=1+((self.presets and #self.presets) or 0)
+    if input:wasPressed("up") or input:wasPressed("left") then
+      self.choiceIndex=self.choiceIndex>1 and self.choiceIndex-1 or count
+      return
+    elseif input:wasPressed("down") or input:wasPressed("right") then
+      self.choiceIndex=self.choiceIndex<count and self.choiceIndex+1 or 1
+      return
+    elseif input:wasPressed("a") or input:wasPressed("start") then
+      if self.choiceIndex==1 then
+        -- NEW NAME is the only route into character entry. The chooser itself
+        -- stays custom, so the stock Gen I list never exists underneath us.
+        self.phase="input"
+        self.row,self.col=1,1
+        self.lower=false
+        self.glyphs={}
+        return
+      end
+      local value=tostring(self.presets[self.choiceIndex-1] or "")
+      if value=="" then return end
+      if self.game and self.game.stack then self.game.stack:pop() end
+      if self.onDone then self.onDone(value,false) end
+      return
+    end
+    -- Intro name selection is intentionally not cancelable, matching the
+    -- cartridge flow. B does nothing until the character-entry phase.
+    return
+  end
+
   local grid=self:grid()
   local caseRow=#grid
 
@@ -16896,24 +18450,59 @@ function GoldCompat.installSafeGen1IntroNaming()
       end
     end
 
-    local state=SafeIntroNaming.new(game,{
-      title=step.title or (who=="rival" and Strings("HIS NAME?") or Strings("YOUR NAME?")),
-      presets=presets,
-      maxLen=step.maxLen or self.nameLen or 7,
-      onDone=function(name)
-        -- The intro must never hand an empty name into later text substitution.
-        if not name or name=="" then name=tostring(presets[1] or (who=="rival" and "BLUE" or "RED")) end
-        if type(game.save)~="table" then game.save={} end
-        if type(game.save.player)~="table" then game.save.player={} end
-        if who=="rival" then game.save.player.rival=name
-        else game.save.player.name=name end
-        if type(self.recordAnswer)=="function" then
-          self:recordAnswer(step,1,name,name)
-        end
-        self:advance()
-      end,
-    })
-    game.stack:push(state)
+    local function openNaming()
+      local state=SafeIntroNaming.new(game,{
+        title=step.title or (who=="rival" and Strings("HIS NAME?") or Strings("YOUR NAME?")),
+        presets=presets,
+        maxLen=step.maxLen or self.nameLen or 7,
+        onDone=function(name,custom)
+          -- The intro must never hand an empty name into later text substitution.
+          if not name or name=="" then name=tostring(presets[1] or (who=="rival" and "BLUE" or "RED")) end
+          if type(game.save)~="table" then game.save={} end
+          if type(game.save.player)~="table" then game.save.player={} end
+          if who=="rival" then game.save.player.rival=name
+          else game.save.player.name=name end
+          if type(self.recordAnswer)=="function" then
+            self:recordAnswer(step,1,name,name)
+          end
+
+          -- Mirror OakSpeech's native `name` step handoff exactly.  The prior
+          -- `say` step deliberately leaves its TextBox alive underneath the
+          -- naming screen.  Advancing without closing it resurrects the old
+          -- "First, what is your name?" prompt over the next intro beat.
+          if type(self.closeHoldBox)=="function" then
+            self:closeHoldBox()
+          elseif self.holdBox and game.stack and game.stack.top
+              and game.stack:top()==self.holdBox then
+            game.stack:pop()
+            self.holdBox=nil
+          end
+
+          if custom==true then
+            -- Native custom-name branch recenters immediately.
+            self.picSlide=0
+            self:advance()
+          elseif type(self.slidePic)=="function" then
+            -- Native preset branch performs OakSpeechSlidePicLeft with the
+            -- cartridge's 13-frame pre-slide beat, then advances.
+            self:slidePic(-1,function() self:advance() end,13)
+          else
+            self.picSlide=0
+            self:advance()
+          end
+        end,
+      })
+      game.stack:push(state)
+    end
+
+    -- The native name step first moves the portrait right, then opens the
+    -- naming screen.  Keeping this choreography also guarantees the held
+    -- prompt remains underneath the naming state until completion.
+    if type(self.slidePic)=="function" then
+      self:slidePic(1,openNaming)
+    else
+      openNaming()
+    end
   end
 end
 
@@ -16946,6 +18535,7 @@ function GoldCompat.patchFlowClass(moduleName,kind,captureOldSpecies)
       local self=class.__colosseumOriginalNew(...)
       if type(self)=="table" then
         self.__colosseumFlowKind=kind
+        self.__gen3uiBattleOverlay=GoldCompat.flowPresentationEnabled(kind) and true or nil
         if captureOldSpecies then
           local mon
           if type(args[2])=="table" and args[2].species then
@@ -17031,11 +18621,19 @@ function GoldCompat.patchFlowClass(moduleName,kind,captureOldSpecies)
   end
 
   class.drawsWidescreen=function(self,...)
-    if GoldCompat.flowPresentationEnabled(kind) then return false end
+    if GoldCompat.flowPresentationEnabled(kind) then
+      local inherited=GoldCompat.inheritBattleSurfaceFlag(self,"drawsWidescreen")
+      if inherited~=nil then return inherited end
+      return false
+    end
     return callOriginal(class.__colosseumOriginalDrawsWidescreen,self,...)
   end
   class.wantsFillScale=function(self,...)
-    if GoldCompat.flowPresentationEnabled(kind) then return false end
+    if GoldCompat.flowPresentationEnabled(kind) then
+      local inherited=GoldCompat.inheritBattleSurfaceFlag(self,"wantsFillScale")
+      if inherited~=nil then return inherited end
+      return false
+    end
     return callOriginal(class.__colosseumOriginalWantsFillScale,self,...)
   end
   class.draw=function(self,...)
@@ -17051,18 +18649,22 @@ function GoldCompat.patchFlowClass(moduleName,kind,captureOldSpecies)
     self.isOpaque=class.__colosseumOriginalOpaque
     return callOriginal(class.__colosseumOriginalDraw,self,...)
   end
-  class.drawWidescreen=function(self,...)
+  class.drawWidescreen=function(self,winW,winH,...)
     if self.__colosseumRenderFailed then
       self.isOpaque=class.__colosseumOriginalOpaque
-      return callOriginal(class.__colosseumOriginalDrawWidescreen,self,...)
+      return callOriginal(class.__colosseumOriginalDrawWidescreen,self,winW,winH,...)
     end
     if GoldCompat.flowPresentationEnabled(kind) then
       self.__colosseumFlowKind=kind
       self.isOpaque=false
+      if GoldCompat.generation=="gen2"
+          and GoldCompat.drawBattleWidescreenUnderOverlay(self,winW,winH) then
+        return
+      end
       return
     end
     self.isOpaque=class.__colosseumOriginalOpaque
-    return callOriginal(class.__colosseumOriginalDrawWidescreen,self,...)
+    return callOriginal(class.__colosseumOriginalDrawWidescreen,self,winW,winH,...)
   end
   return true
 end
@@ -17996,11 +19598,19 @@ function GoldCompat.installGoldServiceUI()
     PackMenu.__gen3uiOriginalWantsFillScale=PackMenu.wantsFillScale
     PackMenu.isOpaque=false
     PackMenu.wantsFillScale=function(self,...)
-      if GoldCompat.bagPresentationEnabled() then return false end
+      if GoldCompat.bagPresentationEnabled() then
+        local inherited=GoldCompat.inheritBattleSurfaceFlag(self,"wantsFillScale")
+        if inherited~=nil then return inherited end
+        return false
+      end
       return callOriginal(PackMenu.__gen3uiOriginalWantsFillScale,self,...)
     end
     PackMenu.drawsWidescreen=function(self,...)
-      if GoldCompat.bagPresentationEnabled() then return false end
+      if GoldCompat.bagPresentationEnabled() then
+        local inherited=GoldCompat.inheritBattleSurfaceFlag(self,"drawsWidescreen")
+        if inherited~=nil then return inherited end
+        return false
+      end
       return callOriginal(PackMenu.__gen3uiOriginalDrawsWidescreen,self,...)
     end
     PackMenu.new=function(...)
@@ -18037,6 +19647,9 @@ function GoldCompat.installGoldServiceUI()
       if GoldCompat.bagPresentationEnabled() then
         self.isOpaque=false
         self.__gen3uiGoldOverlayKind="pack"
+        -- In battle the Pack is the compositor's top wide owner. Delegate the
+        -- physical background to BattleState once; render.hud paints the Pack.
+        GoldCompat.drawBattleWidescreenUnderOverlay(self,winW,winH)
         return
       end
       self.isOpaque=PackMenu.__gen3uiOriginalOpaque
@@ -18483,20 +20096,81 @@ function GoldCompat.drawGoldSave(saveMenu)
 end
 
 function GoldCompat.goldOptionValue(menu,row)
-  if row.frame then return "TYPE "..tostring(menu.options.frame or 1) end
+  if type(row)~="table" then return "" end
+  local options=menu and menu.options
+  if type(options)~="table" then
+    local game=menu and menu.game
+    options=(game and game.save and game.save.options)
+      or (game and game.options) or {}
+  end
+  if row.frame then return "TYPE "..tostring(options.frame or 1) end
   if row.text then
-    local ok,v=pcall(row.text,menu.options)
+    local ok,v=pcall(row.text,options)
     if ok then return tostring(v) end
   end
   if row.values then
-    local v=menu.options[row.key]
+    local v=options[row.key]
     return tostring((row.display and row.display[v]) or v or "")
   end
   if type(row.value)=="function" then
-    local ok,v=pcall(row.value,menu.game)
+    local ok,v=pcall(row.value,menu and menu.game)
     if ok then return tostring(v) end
   end
   return ""
+end
+
+-- Gen1Recomp 0.2.36 changed both OPTION screens from one flat row list to a
+-- presentation `view`: group openers live in the view while `rows` remains the
+-- old flat mod-facing registry.  The engine cursor/index now points at the
+-- view.  Rendering `menu.rows` against `menu.index` therefore highlights the
+-- wrong setting and A can open a completely different page than the card says.
+--
+-- Prefer the screen's own visible/view list when available.  Gen 1 keeps BACK
+-- as a fixed row outside its view; Gen 2 includes BACK in the view itself.  A
+-- synthetic BACK entry preserves the former without duplicating the latter,
+-- and also keeps compatibility with older recomp builds that had no view.
+function GoldCompat.optionsPresentationRows(menu)
+  local rows=nil
+  if menu and type(menu.visible)=="function" then
+    local ok,value=pcall(menu.visible,menu)
+    if ok and type(value)=="table" then rows=value end
+  end
+  if type(rows)~="table" and menu and type(menu.view)=="table" then
+    rows=menu.view
+  end
+  if type(rows)~="table" then rows=(menu and menu.rows) or {} end
+
+  local out={}
+  local hasBack=false
+  for i,row in ipairs(rows) do
+    out[i]=row
+    if type(row)=="table" and
+        (row.cancel==true or row.id=="cancel" or row.__gen3uiSyntheticBack) then
+      hasBack=true
+    end
+  end
+  if not hasBack then
+    out[#out+1]={
+      id="__gen3ui_back",
+      label="BACK",
+      cancel=true,
+      __gen3uiSyntheticBack=true,
+    }
+  end
+  return out
+end
+
+-- Our overhaul intentionally keeps OPTIONS as one direct hanging list rather
+-- than inheriting Gen1Recomp 0.2.36's new category landing page.  `rows`
+-- remains the engine's authoritative flat descriptors, so pointing `view`
+-- back at that same table preserves every new option and every native
+-- step/activate callback while keeping the custom selector and selected row in
+-- one coordinate system.  This is presentation-only: option values, saving and
+-- callbacks remain owned by the recomp.
+function GoldCompat.flattenOptionsForCustomUI(menu)
+  if type(menu)~="table" or type(menu.rows)~="table" then return menu end
+  menu.view=menu.rows
+  return menu
 end
 
 function GoldCompat.trainerPortraitShader()
@@ -18700,9 +20374,13 @@ function GoldCompat.gen1ManagerRows(manager)
 end
 
 function GoldCompat.drawGen1OptionsHanging(menu)
-  local rows=menu.rows or {}
-  local total=#rows+1
-  local index=math.max(1,math.min(total,menu.index or 1))
+  local rows=GoldCompat.optionsPresentationRows(menu)
+  local total=#rows
+  if total<=0 then return end
+
+  -- 0.2.36's index is presentation-view-relative.  Keep the custom panel's
+  -- seven-row viewport, but never reinterpret that index as a flat-row index.
+  local index=math.max(1,math.min(total,tonumber(menu and menu.index) or 1))
   local visible=math.min(7,total)
   local first=math.max(1,math.min(index-2,math.max(1,total-visible+1)))
 
@@ -18718,25 +20396,33 @@ function GoldCompat.drawGen1OptionsHanging(menu)
     local idx=first+r-1
     if idx<=total then
       local row=rows[idx]
-      local isCancel=idx==total
       local yy=y+19+(r-1)*rowH
       local selected=idx==index
+      local isBack=type(row)=="table" and
+        (row.cancel==true or row.id=="cancel" or row.__gen3uiSyntheticBack)
 
       if selected then
         g.push("all"); g.translate(ox,oy); g.scale(sc,sc)
         g.setColor(0.11,0.28,0.38,1)
         roundedRect("fill",x+4,yy-1,w-8,rowH-1,2)
+        -- The accent belongs to the engine-selected VIEW row now.  Keeping it
+        -- tied to the same row as the highlight prevents the orphaned/offset
+        -- selector seen after the 0.2.36 grouped-options update.
         g.setColor(1.00,0.36,0.16,1)
         g.rectangle("fill",x+4,yy-1,1.5,rowH-1)
         g.pop()
       end
 
-      local label=isCancel and "CANCEL" or tostring(row and row.label or "")
+      local label=isBack and tostring(row and row.label or "BACK") or tostring(row and row.label or "")
       local value=""
-      if row then value=tostring(GoldCompat.goldOptionValue(menu,row) or "") end
+      if row and not isBack then
+        value=tostring(GoldCompat.goldOptionValue(menu,row) or "")
+      end
 
-      -- Full labels: give the label column most of the card instead of
-      -- truncating it to ten 8px glyphs.
+      -- Group openers introduced by 0.2.36 are first-class rows.  Gen 1
+      -- supplies an "N OPTIONS" value; Gold intentionally leaves the value
+      -- column blank.  Both flow through the same renderer without inventing
+      -- a second cursor model.
       finalTextFitted(label,x+8,yy+1,3.0,1.75,
         selected and {1,1,1,1} or {0.84,0.94,0.92,1},
         ox,oy,sc,"left",49,rowH-2)
@@ -18744,8 +20430,21 @@ function GoldCompat.drawGen1OptionsHanging(menu)
         finalTextFitted(value,x+59,yy+1,2.85,1.55,
           selected and {1,1,1,1} or {0.49,0.78,0.80,1},
           ox,oy,sc,"right",45,rowH-2)
+      elseif row and row.group then
+        finalText(">",x+w-11,yy+1,2.6,
+          selected and {1,1,1,1} or {0.49,0.78,0.80,1},
+          ox,oy,sc,"left",7)
       end
     end
+  end
+
+  if first>1 then
+    finalText("▲",x+w-10,y+18,2.2,
+      {0.32,0.32,0.29,1},ox,oy,sc)
+  end
+  if first+visible-1<total then
+    finalText("▼",x+w-10,y+h-12,2.2,
+      {0.32,0.32,0.29,1},ox,oy,sc)
   end
 
   finalText("LEFT / RIGHT: CHANGE   A: SELECT   B: BACK",
@@ -19784,6 +21483,7 @@ function GoldCompat.installGen1ModernScreens()
       OptionsMenu.new=function(...)
         local self=OptionsMenu.__gen3uiOriginalNew(...)
         if screenFeatureEnabled("revampedOptionsUI") then
+          GoldCompat.flattenOptionsForCustomUI(self)
           self.isOpaque=false
           self.__gen3uiHangingOptions=true
           State.activeGen1Options=self
@@ -19797,6 +21497,7 @@ function GoldCompat.installGen1ModernScreens()
     if type(OptionsMenu.__gen3uiOriginalUpdate)=="function" then
       OptionsMenu.update=function(self,...)
         if screenFeatureEnabled("revampedOptionsUI") then
+          GoldCompat.flattenOptionsForCustomUI(self)
           self.isOpaque=false
           self.__gen3uiHangingOptions=true
         end
@@ -19806,6 +21507,7 @@ function GoldCompat.installGen1ModernScreens()
 
     OptionsMenu.draw=function(self,...)
       if screenFeatureEnabled("revampedOptionsUI") then
+        GoldCompat.flattenOptionsForCustomUI(self)
         self.__gen3uiHangingOptions=true
         self.isOpaque=false
         State.activeGen1Options=self
@@ -19960,13 +21662,64 @@ function GoldCompat.installGen1ModernScreens()
   GoldCompat.gen1ModernScreensInstalled=true
 end
 
+function GoldCompat.gen2CustomMenuOwnsFade(id)
+  id=tostring(id or ""):lower()
+  if id=="pokemon" then return featureEnabled("colosseumPokemonMenu") end
+  if id=="pack" then return GoldCompat.bagPresentationEnabled() end
+  if id=="pokegear" then return goldScreenEnabled("revampedPokegearUI") end
+  if id=="status" then return goldScreenEnabled("revampedTrainerCardUI") end
+  if id=="pokedex" then return goldScreenEnabled("revampedPokedex") end
+  if id=="option" then return goldScreenEnabled("revampedOptionsUI") end
+  return false
+end
+
+function GoldCompat.installGen2MenuFadeCompatibility()
+  if GoldCompat.generation~="gen2" then return end
+  local ok,MenuFade=pcall(require,"src.ui.gen2.MenuFade")
+  if not (ok and type(MenuFade)=="table") or MenuFade.__colosseumUiFadePatched then return end
+  MenuFade.__colosseumUiFadePatched=true
+  MenuFade.__colosseumUiOriginalOpenWhite=MenuFade.openWhite
+  MenuFade.__colosseumUiOriginalCloseWhite=MenuFade.closeWhite
+
+  -- Gen1Recomp 2.52 restored the cartridge's white VRAM/reload sheets between
+  -- Gold START submenus. Our replacement screens are transparent final-HUD
+  -- overlays and do not need those native reload frames; inheriting them creates
+  -- a full-window white flash underneath the touch controls. Suppress the fade
+  -- only for a route currently owned by this UI, and leave vanilla behavior
+  -- byte-for-byte equivalent when the corresponding overhaul option is OFF.
+  MenuFade.openWhite=function(id,partySize)
+    if GoldCompat.gen2CustomMenuOwnsFade(id) then return nil end
+    return MenuFade.__colosseumUiOriginalOpenWhite(id,partySize)
+  end
+  MenuFade.closeWhite=function(id)
+    if GoldCompat.gen2CustomMenuOwnsFade(id) then return nil end
+    return MenuFade.__colosseumUiOriginalCloseWhite(id)
+  end
+end
+
 function GoldCompat.installCoreMenuUI()
   if GoldCompat.generation~="gen2" or GoldCompat.coreMenusInstalled then return end
+  GoldCompat.installGen2MenuFadeCompatibility()
 
   local okStart,StartMenu=pcall(require,"src.ui.gen2.StartMenu")
   if okStart and type(StartMenu)=="table" and not StartMenu.__gen3uiVisualPatched then
     StartMenu.__gen3uiVisualPatched=true
+    StartMenu.__gen3uiOriginalNew=StartMenu.new
     StartMenu.__gen3uiOriginalDraw=StartMenu.draw
+
+    if type(StartMenu.__gen3uiOriginalNew)=="function" then
+      StartMenu.new=function(...)
+        local self=StartMenu.__gen3uiOriginalNew(...)
+        if featureEnabled("revampedOverworldMenus") then
+          -- Publish ownership at construction time, but do NOT call
+          -- prepareGoldStartMenu yet: that helper temporarily swaps the menu's
+          -- live items for presentation copies and belongs in the draw pass.
+          self.__gen3uiStart=true
+          State.activeStartMenu=self
+        end
+        return self
+      end
+    end
 
     -- Same ownership model as Gen 1 START: suppress native Gold chrome, keep
     -- the state/input fully native, and render the mature final-window START UI
@@ -20044,6 +21797,7 @@ function GoldCompat.installCoreMenuUI()
       and not OptionsMenu.__gen3uiVisualPatched then
     OptionsMenu.__gen3uiVisualPatched=true
     OptionsMenu.__gen3uiOriginalNew=OptionsMenu.new
+    OptionsMenu.__gen3uiOriginalUpdate=OptionsMenu.update
     OptionsMenu.__gen3uiOriginalDraw=OptionsMenu.draw
     OptionsMenu.__gen3uiOriginalDrawWidescreen=OptionsMenu.drawWidescreen
     OptionsMenu.__gen3uiOriginalDrawsWidescreen=OptionsMenu.drawsWidescreen
@@ -20064,6 +21818,7 @@ function GoldCompat.installCoreMenuUI()
       OptionsMenu.new=function(...)
         local self=OptionsMenu.__gen3uiOriginalNew(...)
         if goldScreenEnabled("revampedOptionsUI") then
+          GoldCompat.flattenOptionsForCustomUI(self)
           self.isOpaque=false
           self.__gen3uiGoldOverlayKind="options"
         else
@@ -20074,8 +21829,20 @@ function GoldCompat.installCoreMenuUI()
       end
     end
 
+    if type(OptionsMenu.__gen3uiOriginalUpdate)=="function" then
+      OptionsMenu.update=function(self,...)
+        if goldScreenEnabled("revampedOptionsUI") then
+          GoldCompat.flattenOptionsForCustomUI(self)
+          self.isOpaque=false
+          self.__gen3uiGoldOverlayKind="options"
+        end
+        return callOriginal(OptionsMenu.__gen3uiOriginalUpdate,self,...)
+      end
+    end
+
     OptionsMenu.draw=function(self,...)
       if goldScreenEnabled("revampedOptionsUI") then
+        GoldCompat.flattenOptionsForCustomUI(self)
         self.isOpaque=false
         self.__gen3uiGoldOverlayKind="options"
         return
@@ -20087,6 +21854,7 @@ function GoldCompat.installCoreMenuUI()
 
     OptionsMenu.drawWidescreen=function(self,...)
       if goldScreenEnabled("revampedOptionsUI") then
+        GoldCompat.flattenOptionsForCustomUI(self)
         self.isOpaque=false
         self.__gen3uiGoldOverlayKind="options"
         return
@@ -20251,11 +22019,19 @@ function GoldCompat.installCoreMenuUI()
     PartyMenu.__gen3uiOriginalDrawsWidescreen=PartyMenu.drawsWidescreen
     PartyMenu.__gen3uiOriginalWantsFillScale=PartyMenu.wantsFillScale
     PartyMenu.drawsWidescreen=function(self)
-      if featureEnabled("colosseumPokemonMenu") then return false end
+      if featureEnabled("colosseumPokemonMenu") then
+        local inherited=GoldCompat.inheritBattleSurfaceFlag(self,"drawsWidescreen")
+        if inherited~=nil then return inherited end
+        return false
+      end
       return callOriginal(PartyMenu.__gen3uiOriginalDrawsWidescreen,self)
     end
     PartyMenu.wantsFillScale=function(self)
-      if featureEnabled("colosseumPokemonMenu") then return false end
+      if featureEnabled("colosseumPokemonMenu") then
+        local inherited=GoldCompat.inheritBattleSurfaceFlag(self,"wantsFillScale")
+        if inherited~=nil then return inherited end
+        return false
+      end
       return callOriginal(PartyMenu.__gen3uiOriginalWantsFillScale,self)
     end
     if type(PartyMenu.new)=="function" then
@@ -20264,6 +22040,12 @@ function GoldCompat.installCoreMenuUI()
         if featureEnabled("colosseumPokemonMenu") then
           self.isOpaque=false
           self.__gen3uiColosseumParty=true
+          -- render_visible is evaluated before draw(); publish the HUD-owned
+          -- kind here so the native Party surface can never become the frame
+          -- base while the Colosseum Party overlay is active.
+          self.__gen3uiGoldOverlayKind="party"
+        else
+          self.__gen3uiGoldOverlayKind=nil
         end
         return self
       end
@@ -20317,6 +22099,7 @@ function GoldCompat.installCoreMenuUI()
       if featureEnabled("colosseumPokemonMenu") then
         self.isOpaque=false
         self.__gen3uiGoldOverlayKind="party"
+        GoldCompat.drawBattleWidescreenUnderOverlay(self,winW,winH)
         return
       end
       self.__gen3uiGoldOverlayKind=nil
@@ -20337,19 +22120,30 @@ function GoldCompat.installCoreMenuUI()
     SummaryMenu.__gen3uiOriginalDrawsWidescreen=SummaryMenu.drawsWidescreen
     SummaryMenu.__gen3uiOriginalWantsFillScale=SummaryMenu.wantsFillScale
     SummaryMenu.drawsWidescreen=function(self)
-      if GoldCompat.pokemonPresentationEnabled() then return false end
+      if GoldCompat.pokemonPresentationEnabled() then
+        local inherited=GoldCompat.inheritBattleSurfaceFlag(self,"drawsWidescreen")
+        if inherited~=nil then return inherited end
+        return false
+      end
       return callOriginal(SummaryMenu.__gen3uiOriginalDrawsWidescreen,self)
     end
     SummaryMenu.wantsFillScale=function(self)
-      if GoldCompat.pokemonPresentationEnabled() then return false end
+      if GoldCompat.pokemonPresentationEnabled() then
+        local inherited=GoldCompat.inheritBattleSurfaceFlag(self,"wantsFillScale")
+        if inherited~=nil then return inherited end
+        return false
+      end
       return callOriginal(SummaryMenu.__gen3uiOriginalWantsFillScale,self)
     end
     if type(SummaryMenu.__gen3uiOriginalNew)=="function" then
       SummaryMenu.new=function(...)
         local self=SummaryMenu.__gen3uiOriginalNew(...)
         if type(self)=="table" then
-          self.isOpaque=GoldCompat.pokemonPresentationEnabled()
-            and false or SummaryMenu.__gen3uiOriginalOpaque
+          local enabled=GoldCompat.pokemonPresentationEnabled()
+          self.isOpaque=enabled and false or SummaryMenu.__gen3uiOriginalOpaque
+          -- Same first-frame rule as Pack/Party: the custom HUD owns the
+          -- presentation, so mark it before the stack asks render_visible.
+          self.__gen3uiGoldOverlayKind=enabled and "summary" or nil
         end
         return self
       end
@@ -20422,6 +22216,7 @@ function GoldCompat.installCoreMenuUI()
       if GoldCompat.pokemonPresentationEnabled() then
         self.isOpaque=false
         self.__gen3uiGoldOverlayKind="summary"
+        GoldCompat.drawBattleWidescreenUnderOverlay(self,winW,winH)
         return
       end
       self.isOpaque=SummaryMenu.__gen3uiOriginalOpaque
@@ -20443,11 +22238,19 @@ function GoldCompat.installCoreMenuUI()
     PokedexMenu.__gen3uiOriginalDrawsWidescreen=PokedexMenu.drawsWidescreen
     PokedexMenu.__gen3uiOriginalWantsFillScale=PokedexMenu.wantsFillScale
     PokedexMenu.drawsWidescreen=function(self)
-      if goldScreenEnabled("revampedPokedex") then return false end
+      if goldScreenEnabled("revampedPokedex") then
+        local inherited=GoldCompat.inheritBattleSurfaceFlag(self,"drawsWidescreen")
+        if inherited~=nil then return inherited end
+        return false
+      end
       return callOriginal(PokedexMenu.__gen3uiOriginalDrawsWidescreen,self)
     end
     PokedexMenu.wantsFillScale=function(self)
-      if goldScreenEnabled("revampedPokedex") then return false end
+      if goldScreenEnabled("revampedPokedex") then
+        local inherited=GoldCompat.inheritBattleSurfaceFlag(self,"wantsFillScale")
+        if inherited~=nil then return inherited end
+        return false
+      end
       return callOriginal(PokedexMenu.__gen3uiOriginalWantsFillScale,self)
     end
 
@@ -20529,6 +22332,7 @@ function GoldCompat.installCoreMenuUI()
       if goldScreenEnabled("revampedPokedex") then
         self.isOpaque=false
         self.__gen3uiGoldOverlayKind="pokedex"
+        self.__gen3uiBattleOverlay=true
         return
       end
       self.isOpaque=PokedexMenu.__gen3uiOriginalOpaque
@@ -20539,6 +22343,7 @@ function GoldCompat.installCoreMenuUI()
       if goldScreenEnabled("revampedPokedex") then
         self.isOpaque=false
         self.__gen3uiGoldOverlayKind="pokedex"
+        if GoldCompat.drawBattleWidescreenUnderOverlay(self,winW,winH) then return end
         return
       end
       self.isOpaque=PokedexMenu.__gen3uiOriginalOpaque
@@ -20557,6 +22362,7 @@ function GoldCompat.installCoreMenuUI()
       end
       self.isOpaque=false
       self.__gen3uiGoldOverlayKind="pokedex"
+      self.__gen3uiBattleOverlay=true
       self.draw=function(inst)
         inst.isOpaque=false
         inst.__gen3uiGoldOverlayKind="pokedex"
@@ -20564,10 +22370,17 @@ function GoldCompat.installCoreMenuUI()
       self.drawWidescreen=function(inst,winW,winH)
         inst.isOpaque=false
         inst.__gen3uiGoldOverlayKind="pokedex"
+        GoldCompat.drawBattleWidescreenUnderOverlay(inst,winW,winH)
       end
       self.update=PokedexMenu.update
-      self.drawsWidescreen=function() return false end
-      self.wantsFillScale=function() return false end
+      self.drawsWidescreen=function(inst)
+        local inherited=GoldCompat.inheritBattleSurfaceFlag(inst,"drawsWidescreen")
+        return inherited~=nil and inherited or false
+      end
+      self.wantsFillScale=function(inst)
+        local inherited=GoldCompat.inheritBattleSurfaceFlag(inst,"wantsFillScale")
+        return inherited~=nil and inherited or false
+      end
       return self
     end
   end
@@ -20809,7 +22622,92 @@ function GoldCompat.enemyBallsRemaining(state)
   return n,#party
 end
 
+-- Resolve CBE presentation ownership without ever polling its heavyweight
+-- diagnostic status from a frame loop. CBE 1.4.12+ exposes the deliberately
+-- lightweight presentationOwnership() seam, so that one may be sampled live:
+-- Gold can construct BattleState a few frames before CBE actually claims the
+-- world/trainer presentation. Older CBE builds have only exports.status(); that
+-- expensive fallback remains cached once per BattleState.
+function GoldCompat.cbeBattleOwnership(state)
+  if not (state and state.battle) then
+    return {world=false,trainer=false}
+  end
+
+  local cached=rawget(state,"__gen3uiCbeOwnership")
+  if cached and cached.battle==state.battle and type(cached.live)=="function" then
+    -- CBE 1.4.12+ explicitly makes this query filesystem-free. Sample the live
+    -- ownership bit instead of freezing the value during BattleState startup:
+    -- CBE can become active a few frames after Gold constructs the screen.
+    local ok,own=pcall(cached.live,state.battle)
+    if ok and type(own)=="table" then
+      cached.world=own.world==true
+      cached.trainer=not state.battle.wild and own.trainer==true
+    end
+    return cached
+  elseif cached and cached.battle==state.battle and cached.final==true then
+    return cached
+  end
+
+  local ownership={battle=state.battle,world=false,trainer=false}
+  if modRef and type(modRef.find)=="function" then
+    local ok,handle=pcall(modRef.find,"COLOSSEUM_BATTLE_ENVIRONMENTS")
+    if not ok or not handle then
+      ok,handle=pcall(modRef.find,modRef,"COLOSSEUM_BATTLE_ENVIRONMENTS")
+    end
+    local exports=ok and handle and handle.exports
+    if type(exports)=="table" then
+      if type(exports.presentationOwnership)=="function" then
+        ownership.live=exports.presentationOwnership
+        local ownOk,own=pcall(ownership.live,state.battle)
+        if ownOk and type(own)=="table" then
+          ownership.world=own.world==true
+          ownership.trainer=not state.battle.wild and own.trainer==true
+        end
+      elseif type(exports.status)=="function" then
+        -- Older CBE fallback: expensive diagnostics are still sampled once only.
+        local statusOk,status=pcall(exports.status)
+        if statusOk and type(status)=="table" then
+          local host=status.standaloneHost
+          local runtime=status.runtime
+          ownership.world=(type(host)=="table" and host.active==true)
+            or (type(runtime)=="table" and runtime.active==true)
+          if not state.battle.wild then
+            local trainer=status.trainer
+            ownership.trainer=(type(host)=="table" and host.active==true)
+              or (type(trainer)=="table" and trainer.active==true)
+          end
+        end
+        ownership.final=true
+      else
+        ownership.final=true
+      end
+    else
+      ownership.final=true
+    end
+  else
+    ownership.final=true
+  end
+  state.__gen3uiCbeOwnership=ownership
+  return ownership
+end
+
+function GoldCompat.cbeOwnsBattleWorld(state)
+  return GoldCompat.cbeBattleOwnership(state).world==true
+end
+
+function GoldCompat.cbeOwnsEnemyTrainer(state)
+  if not (state and state.battle and not state.battle.wild) then return false end
+  return GoldCompat.cbeBattleOwnership(state).trainer==true
+end
+
 function GoldCompat.drawGoldTrainerSwitchOverlay(state)
+  -- CBE already owns native trainer-picture suppression when its 3D enemy
+  -- actor is live. Do not bypass that contract by redrawing Gold's raw
+  -- trainer frontpic during the KO/replacement handoff.
+  if GoldCompat.cbeOwnsEnemyTrainer(state) then
+    if state then state.__gen3uiTrainerSwitch=nil end
+    return false
+  end
   local tr=state and state.__gen3uiTrainerSwitch
   if not (tr and state.enemyTrainerImage) then return false end
 
@@ -20964,6 +22862,31 @@ function GoldCompat.installGoldBattlePresentation()
   GoldBattleState.__gen3uiOriginalOfferShiftSwitch=GoldBattleState.offerShiftSwitch
   GoldBattleState.__gen3uiOriginalUpdate=GoldBattleState.update
 
+  if type(GoldBattleState.drawPic)=="function"
+      and not GoldBattleState.__gen3uiCbeKoPicScrubbed then
+    GoldBattleState.__gen3uiCbeKoPicScrubbed=true
+    GoldBattleState.__gen3uiOriginalDrawPic=GoldBattleState.drawPic
+    GoldBattleState.drawPic=function(self,mon,back,...)
+      if not back and GoldCompat.cbeOwnsBattleWorld(self) then
+        -- Gold's pure battle model may already have rebound `battle.enemy` to
+        -- the replacement before the outgoing faint/EXP presentation drains.
+        -- `shownMon.enemy` is the screen-authoritative Pokemon until the queued
+        -- send event arrives, so use it (plus faintSlide/picHidden) to prevent
+        -- the native top-right frontpic from leaking over CBE on the killing hit.
+        local shown=self.shownMon and self.shownMon.enemy or mon
+        local shownHp=shown and tonumber(shown.hp)
+        local fainting=self.faintSlide and self.faintSlide.side=="enemy"
+        local hidden=self.picHidden and self.picHidden.enemy
+        if (shownHp and shownHp<=0) or fainting or hidden then return end
+      end
+      -- Native Gold draw paths also use `mon.shiny` for their palette. Feed a
+      -- presentation-only proxy so DV-authoritative shininess survives wrappers
+      -- that omitted the convenience flag, without mutating battle/save data.
+      return GoldBattleState.__gen3uiOriginalDrawPic(
+        self,GoldCompat.spriteResolutionMon(mon),back,...)
+    end
+  end
+
   -- Gold's native level-up stats page is a separate draw path outside the
   -- regular HUD rectangles. Keep its call alive for compatibility, but block
   -- every pixel while our level card or the strict native-UI option owns it.
@@ -21010,11 +22933,21 @@ function GoldCompat.installGoldBattlePresentation()
   end
 
   GoldBattleState.offerShiftSwitch=function(self,mon,...)
-    self.__gen3uiTrainerSwitch={mode="in",frame=0}
+    -- Keep the stock Gold trainer-switch flourish only when no external 3D
+    -- trainer provider owns the enemy actor. CBE's live trainer must remain
+    -- authoritative through lethal damage, the shift prompt and send-out.
+    if GoldCompat.cbeOwnsEnemyTrainer(self) then
+      self.__gen3uiTrainerSwitch=nil
+    else
+      self.__gen3uiTrainerSwitch={mode="in",frame=0}
+    end
     return GoldBattleState.__gen3uiOriginalOfferShiftSwitch(self,mon,...)
   end
 
   GoldBattleState.update=function(self,...)
+    if GoldCompat.cbeOwnsEnemyTrainer(self) then
+      self.__gen3uiTrainerSwitch=nil
+    end
     -- The level-up stat card is a real acknowledgement screen, not a timed
     -- animation.  Hold the underlying Gold battle state here so emulator/game
     -- speed cannot race past it. A (or B) dismisses and then native queue
@@ -21146,6 +23079,28 @@ end
 
 local function clearStaleOverworldOwnership(game)
   local topNow=topState(game)
+  -- Keep a cached Pokédex showroom actor across DATA/action submenus, but do not
+  -- scan the state stack at all when no Pokédex actor is resident.
+  local dexActor=GoldCompat.__stadiumUiActors and GoldCompat.__stadiumUiActors.pokedex
+  local dexCache=GoldCompat.__stadiumUiActorCache and GoldCompat.__stadiumUiActorCache.pokedex
+  local dexCached=dexCache and dexCache.entries and next(dexCache.entries)~=nil
+  local dexPending=GoldCompat.__stadiumUiPending and GoldCompat.__stadiumUiPending.pokedex
+  if dexActor or dexCached or dexPending then
+    local dexOwned=false
+    local stack=game and game.stack and game.stack.states
+    if type(stack)=="table" then
+      for _,state in ipairs(stack) do
+        if state and (state.__gen3uiPokedex or state.__gen3uiPokedexAction
+            or state.__gen3uiDexEntry or state.__gen3uiGoldOverlayKind=="pokedex") then
+          dexOwned=true
+          break
+        end
+      end
+    end
+    if not dexOwned and type(GoldCompat.releaseStadiumUiActor)=="function" then
+      GoldCompat.releaseStadiumUiActor("pokedex")
+    end
+  end
   if topNow and not GoldCompat.supportedOverworldMenuState(topNow)
       and not topNow.__gen3uiStart
       and getmetatable(topNow)~=TextBox
@@ -21259,12 +23214,97 @@ function GoldCompat.drawSafariZoneHud(game)
   return true
 end
 
+function GoldCompat.recoverGen2OverlayOwnership(state)
+  if GoldCompat.generation~="gen2" or type(state)~="table" then return state end
+  if state.__gen3uiGoldOverlayKind or state.__gen3uiStart then return state end
+
+  local mt=getmetatable(state)
+  local classes=GoldCompat.__gen2OverlayClassMap
+  if not classes then
+    classes={}
+    local function load(key,name)
+      local ok,value=pcall(require,name)
+      if ok and type(value)=="table" then classes[key]=value end
+    end
+    load("start","src.ui.gen2.StartMenu")
+    load("party","src.ui.gen2.PartyMenu")
+    load("summary","src.ui.gen2.SummaryMenu")
+    load("pokedex","src.ui.gen2.PokedexMenu")
+    GoldCompat.__gen2OverlayClassMap=classes
+  end
+
+  if mt==classes.start and featureEnabled("revampedOverworldMenus") then
+    state.__gen3uiStart=true
+    state.isOpaque=false
+    State.activeStartMenu=state
+  elseif mt==classes.party and featureEnabled("colosseumPokemonMenu") then
+    state.__gen3uiColosseumParty=true
+    state.__gen3uiGoldOverlayKind="party"
+    state.isOpaque=false
+  elseif mt==classes.summary and GoldCompat.pokemonPresentationEnabled() then
+    state.__gen3uiGoldOverlayKind="summary"
+    state.isOpaque=false
+  elseif mt==classes.pokedex and goldScreenEnabled("revampedPokedex") then
+    state.__gen3uiGoldOverlayKind="pokedex"
+    state.__gen3uiBattleOverlay=true
+    state.isOpaque=false
+  end
+  return state
+end
+
 function GoldCompat.nativeOverlayRenderHidden(state)
   if not state then return false end
   local game=state.game or (modRef and modRef.game) or GoldCompat.game
   if not game then return false end
   local stack=game.stack and game.stack.states
   local top=type(stack)=="table" and stack[#stack] or nil
+
+  -- HARD HANGING-OVERLAY RULE -------------------------------------------------
+  -- Every custom menu that is mirrored in render.hud is presentation-only.
+  -- Keep the real native state on the stack for input/gameplay, but hide that
+  -- state's main-screen render entirely. StateStack:visibleBase() ignores
+  -- render-invisible states, so neither an opaque flag restored by another mod
+  -- nor a native Pack/Party/Summary widescreen clear can replace the battle or
+  -- overworld with black/white. The underlying renderer (CBE, PotatoVoxel,
+  -- another battle provider, or vanilla) therefore draws normally first; our
+  -- UI is composited afterward as a true hanging overlay.
+  if state==top then
+    local kind=state.__gen3uiGoldOverlayKind
+    if GoldCompat.generation=="gen2" and kind then
+      local enabled=(kind=="pack" and GoldCompat.bagPresentationEnabled())
+        or (kind=="party" and featureEnabled("colosseumPokemonMenu"))
+        or (kind=="summary" and GoldCompat.pokemonPresentationEnabled())
+        or (kind=="mart" and goldScreenEnabled("revampedPokeMartUI"))
+        or (kind=="centerpc" and goldScreenEnabled("revampedPokemonPC"))
+        or (kind=="pc-root" and goldScreenEnabled("revampedPokemonPC"))
+        or (kind=="pc-box" and goldScreenEnabled("revampedPokemonPC"))
+        or (kind=="pc-item" and GoldCompat.itemPcPresentationEnabled())
+        or (kind=="pokedex" and goldScreenEnabled("revampedPokedex"))
+        or (kind=="save" and featureEnabled("revampedSaveUI"))
+        or (kind=="options" and goldScreenEnabled("revampedOptionsUI"))
+        or (kind=="mods" and goldScreenEnabled("revampedModsUI"))
+        or (kind=="trainer" and goldScreenEnabled("revampedTrainerCardUI"))
+        or kind=="ui-settings"
+      if enabled then
+        -- In a Gen II battle the top Pack/Party/Summary state must remain
+        -- render-visible long enough for Game2 to select it as the widescreen
+        -- owner. Its native draw is already a no-op; drawWidescreen proxies the
+        -- underlying battle and render.hud supplies the actual menu. Hiding it
+        -- here would make Game2 choose the battle as the base and then redraw
+        -- the whole stack in a centered 160x144 panel -- the lens/mirror bug.
+        if GoldCompat.isBattleWidescreenOverlay(state) then return false end
+        return true
+      end
+    elseif GoldCompat.generation=="gen1" then
+      if (state.__gen3uiBag or state.__gen3uiBagAction)
+          and GoldCompat.bagPresentationEnabled() then return true end
+      if (state.__gen3uiColosseumParty or state.__gen3uiItemTarget
+          or state.__gen3uiKeepTMBackground or state.__gen3uiPPMovePicker)
+          and GoldCompat.pokemonPresentationEnabled() then return true end
+      if state.__gen3uiColosseumSummary
+          and GoldCompat.pokemonPresentationEnabled() then return true end
+    end
+  end
 
   -- Dialogue/YES-NO is rendered in render.hud, after every world/renderer pass.
   -- Hiding the native state here removes both its pixels and its opacity/palette
@@ -21899,13 +23939,24 @@ function GoldCompat.renderHudDialogueLayer(mod,game)
     local box = State.activeDialogueBox
     State.activeDialogueBox = nil
 
-    local okDialogue, errDialogue = pcall(GoldCompat.drawDialogueThemeFinal, box)
-    if not okDialogue then
+    local okDialogue, dialogueResult = pcall(GoldCompat.drawDialogueThemeFinal, box)
+    if not okDialogue or dialogueResult==false then
       if mod.log then
-        mod.log("error","Gen 3 UI final dialogue overlay failed: "..tostring(errDialogue))
+        mod.log("error","Gen 3 UI final dialogue overlay failed: "..tostring(dialogueResult))
       end
+      -- Presentation must fail visible, never fail blank. The native TextBox
+      -- has already yielded its pixels to the overhaul by this point, so a
+      -- themed-renderer exception would otherwise leave the player with no
+      -- dialogue at all. The legacy themed overlay is deliberately simple and
+      -- uses the same live TextBox state/input without taking world ownership.
+      local fallbackOK, fallbackResult=pcall(drawDialogueThemeLegacy,box)
+      drewDialogue=fallbackOK and fallbackResult~=false
+      if not fallbackOK and mod.log then
+        mod.log("error","Gen 3 UI dialogue fallback failed: "..tostring(fallbackResult))
+      end
+    else
+      drewDialogue=true
     end
-    drewDialogue=okDialogue
   else
     State.activeDialogueBox = nil
   end
@@ -22220,6 +24271,49 @@ end
 function GoldCompat.renderHudMenuLayer(mod,game)
   -- Strict fallback ownership for otherwise-unclaimed gameplay states.
   local strictTop=topState(game)
+  if GoldCompat.generation=="gen2" and strictTop then
+    GoldCompat.recoverGen2OverlayOwnership(strictTop)
+  end
+
+  -- API-v2 can now hide our mirrored state before its native draw() runs.
+  -- Recover presentation ownership directly from construction-time markers so
+  -- the custom Bag/Party/Summary still paints on the first frame and after any
+  -- external mod changes opacity/draw order. This is intentionally based on
+  -- the authoritative top state, not on a draw-time side effect.
+  if GoldCompat.generation=="gen1" and strictTop then
+    if strictTop.__gen3uiBag and GoldCompat.bagPresentationEnabled() then
+      State.activeBagMenu=strictTop
+      local okBag,errBag=pcall(drawBagFinal,game,strictTop)
+      if (not okBag) and mod.log then
+        mod.log("error","Colosseum direct Bag overlay failed: "..tostring(errBag))
+      end
+      return okBag
+    end
+    if strictTop.__gen3uiColosseumSummary
+        and GoldCompat.pokemonPresentationEnabled() then
+      DexUI.summary=strictTop
+      local okSummary,errSummary=pcall(DexUI.drawPartySummary,game,strictTop)
+      if (not okSummary) and mod.log then
+        mod.log("error","Colosseum direct Summary overlay failed: "..tostring(errSummary))
+      end
+      return okSummary
+    end
+    if strictTop.__gen3uiColosseumParty
+        and GoldCompat.pokemonPresentationEnabled()
+        and not strictTop.__gen3uiPPMoveParty then
+      State.activeParty=strictTop
+      local okParty,errParty=pcall(drawPartyFinal,game,strictTop)
+      if (not okParty) and mod.log then
+        mod.log("error","Colosseum direct Party overlay failed: "..tostring(errParty))
+      end
+      return okParty
+    end
+    if strictTop.__gen3uiPPMovePicker
+        and GoldCompat.pokemonPresentationEnabled() then
+      State.activePPMoveList=strictTop
+    end
+  end
+
   -- Gen I PP-item move selection is a native ListMenu logically, but visually
   -- remains inside the custom Party deck. Drawing the kept Party object here
   -- gives PP UP / ETHER the same uninterrupted Bag -> Party -> Move flow as
@@ -22357,7 +24451,12 @@ function GoldCompat.renderHudMenuLayer(mod,game)
     end
     return true
   elseif State.activeStartMenu then
-    State.activeStartMenu = nil
+    -- Child START submenus sit above the still-live StartMenu. Keep the reference
+    -- warm so closing a Gen II overlay can redraw START in the very same frame
+    -- instead of waiting for StartMenu.draw to republish ownership.
+    if not stateExistsInStack(game,State.activeStartMenu) then
+      State.activeStartMenu=nil
+    end
   end
 
   if State.activeBagMenu and uiTopState(game, State.activeBagMenu) then
@@ -22685,6 +24784,27 @@ local function renderHudHook(mod,next,game,viewport)
   GoldCompat.game=game or GoldCompat.game
   next(game,viewport)
   if not (love and love.graphics) then return end
+
+  -- The dedicated Pokédex HUD wrapper runs later in the hook chain and owns
+  -- its entire foreground. Avoid probing every unrelated Bag/PC/dialogue/battle
+  -- underlay while a Dex list, action, or DATA page is on top. This is most
+  -- noticeable in Gen 1 where the 3D specimen viewer already has real GPU work
+  -- to do each frame. The engine/provider scene underneath was drawn before
+  -- render.hud, so skipping these UI-only probes cannot remove its backdrop.
+  local hudTop=topState(game)
+  -- Gen 1 Strategy Memo owns its foreground through DexUI.hud later in the
+  -- hook chain, so the general HUD pass can skip unrelated underlay probes.
+  -- Gen 2 is intentionally NOT included here: its Pokédex is a Gold service
+  -- overlay rendered by renderGoldServiceOverlay() below. Treating that state
+  -- like the Gen 1 Dex suppresses the only renderer and produces an invisible
+  -- screen (2.2.0 regression).
+  if GoldCompat.generation~="gen2"
+      and featureEnabled("revampedPokedex") and hudTop
+      and (hudTop==DexUI.active or hudTop==DexUI.action or hudTop==DexUI.entry
+        or hudTop.__gen3uiPokedex or hudTop.__gen3uiPokedexAction
+        or hudTop.__gen3uiDexEntry) then
+    return false
+  end
 
   -- Donor-screen skinning deliberately maps old warm panels into the
   -- Colosseum accent palette. Keep it around inherited menu underlays, but
@@ -23048,6 +25168,11 @@ return function(mod)
   end
 
   State.Installers.installVerifiedOptions(mod)
+  -- The installer is the first point where the live options facade is guaranteed
+  -- to exist. Discard any defaults sampled during module construction and begin
+  -- the runtime with fresh option/provider epochs.
+  GoldCompat.invalidateOptionValue(nil)
+  GoldCompat.invalidatePresentationProviders(true)
   GoldCompat.installTitleExperience(mod)
 
   -- Gen I's original 20-distinct-item cartridge limit conflicts with the
@@ -23122,8 +25247,25 @@ return function(mod)
   State.Installers.installDialogueThemeDirect(mod)
   if mod.events and mod.events.on then
     mod.events:on("mod.options_changed", function(payload)
+      -- Keep the hot option cache coherent and revalidate presentation-provider
+      -- ownership after ANY mod changes its presentation settings. This is what
+      -- makes the resident 3D fast path safe without rediscovering providers on
+      -- every frame.
+      if payload and payload.mod==mod.id and payload.key~=nil then
+        GoldCompat.invalidateOptionValue(payload.key,payload.value,true)
+      end
+      GoldCompat.invalidatePresentationProviders(true)
       State.Installers.handleModOptionChanged(mod,payload)
     end)
+
+    -- Gen II compositor invariant: every transparent state pushed above an
+    -- active battle inherits the battle's physical widescreen surface. This
+    -- is deliberately screen-agnostic so future/custom UI flows cannot
+    -- reintroduce the centred mirror/lens redraw.
+    mod.events:on("screen.pushed", function(payload)
+      local state=type(payload)=="table" and payload.state or nil
+      if state then GoldCompat.installBattleSurfaceProxy(state) end
+    end,25000)
 
     -- Gen1Recomp does not expose stable lifetime battle/faint totals on every
     -- generation/save schema. Track them forward inside the save itself from
@@ -23152,14 +25294,63 @@ return function(mod)
   -- Read-only compatibility contract for presentation mods that want to
   -- cooperate without knowing our implementation details.
   mod.exports=mod.exports or {}
+
+  -- Cross-mod hanging-overlay contract. A world presenter such as CBE owns the
+  -- physical battle scene while this UI owns Bag/Party/Summary presentation in
+  -- render.hud. Gen1Recomp still keeps the real native menu states on the stack
+  -- for input/gameplay, which means a wide Gen II battle can otherwise be drawn
+  -- a second time through the classic 160x144 contained surface underneath the
+  -- transparent menu. Expose the ownership fact explicitly so environment mods
+  -- can suppress ONLY that redundant contained world pass without depending on
+  -- our private marker names or hiding the live arena itself.
+  local function hangingBattleOverlay(game)
+    game=game or (mod and mod.game)
+    local states=game and game.stack and game.stack.states
+    if type(states)~="table" or #states<2 then return nil end
+
+    local battleIndex=nil
+    for i=#states,1,-1 do
+      local st=states[i]
+      if st==State.activeBattle or getmetatable(st)==BattleState
+          or GoldCompat.isGen2BattleState(st) then
+        battleIndex=i
+        break
+      end
+    end
+    if not battleIndex or battleIndex>=#states then return nil end
+
+    -- The topmost non-opaque state above BattleState is the hanging owner.
+    -- Keep specific marker names only as descriptive metadata; compositor
+    -- correctness no longer depends on recognizing a particular screen.
+    for i=#states,battleIndex+1,-1 do
+      local st=states[i]
+      if st and st.isOpaque~=true and GoldCompat.uiOwnsBattleOverlayState(st) then
+        return st.__gen3uiGoldOverlayKind or st.__colosseumFlowKind or "overlay"
+      end
+    end
+    return nil
+  end
+
   mod.exports.uiOwnership={
-    apiVersion=1,
+    apiVersion=2,
     ownsBattleUi=function(state) return GoldCompat.ownsNativeBattleLayer(state) end,
     nativeBattleUiVisible=function(state) return not GoldCompat.ownsNativeBattleLayer(state) end,
+    hangingBattleOverlay=function(battle)
+      local game=(type(battle)=="table" and (battle.game
+        or (battle.battle and battle.battle.game))) or (mod and mod.game)
+      local kind=hangingBattleOverlay(game)
+      if not kind then return {active=false} end
+      return {
+        active=true,kind=kind,worldThrough=true,
+        suppressContainedBattleWorld=true,
+      }
+    end,
     presentation="final-ui-layer",
   }
 
-  local baHandle = mod.find and mod.find("BATTLE_ART_VOXEL_FORK") or nil
+  local baHandle = GoldCompat.findLoadedMod("BATTLE_ART_VOXEL_GEN2")
+    or GoldCompat.findLoadedMod("BATTLE_ART_VOXEL_FORK")
+    or GoldCompat.findLoadedMod("DRAMATIC_SHAPE")
   local baPresentation = baHandle and baHandle.exports
       and baHandle.exports.battlePresentation or nil
   local baNativeContract = baPresentation
@@ -23196,6 +25387,18 @@ return function(mod)
     -- outside renderer-specific draw functions, so changing isOpaque or
     -- reordering another mod's compositor cannot expose the native box beneath.
     mod.hooks:wrap("screen.render_visible",function(next,state)
+      -- `visibleBase()` asks this hook before Game2 resolves its widescreen
+      -- owner, making it the final no-race seam for a newly pushed battle UI.
+      -- screen.pushed normally installs the proxy first; this catches any
+      -- state whose ownership marker became available during enter().
+      if GoldCompat.generation=="gen2" then
+        -- 2.52 can resolve visibleBase before an instance's first draw().
+        -- Recover the class-owned overlay marker here so a freshly pushed or
+        -- freshly revealed Gold menu can never become an opaque white base for
+        -- one transition frame.
+        GoldCompat.recoverGen2OverlayOwnership(state)
+        GoldCompat.installBattleSurfaceProxy(state)
+      end
       local visible=next(state)
       if visible==false then return false end
       if GoldCompat.nativeOverlayRenderHidden(state) then return false end
@@ -23211,12 +25414,17 @@ return function(mod)
     -- because StadiumBattleFX deliberately reattaches its presentation host
     -- at the battle boundary.
     mod.events:on("mods.loaded",function()
+      GoldCompat.invalidatePresentationProviders(true)
       GoldCompat.installBattleUiFirewall()
     end,-20000)
     mod.events:on("battle.started",function(payload)
       local battle=payload and (payload.battle or payload.state)
       if battle then State.activeBattle=battle end
       GoldCompat.installBattleUiFirewall()
+      local states=mod.game and mod.game.stack and mod.game.stack.states or {}
+      for _,state in ipairs(states) do
+        if state~=battle then GoldCompat.installBattleSurfaceProxy(state) end
+      end
     end,-20000)
   end
   if baNativeContract and mod.log then
@@ -23316,7 +25524,7 @@ return function(mod)
     return GoldCompat.repairGen1TransientZones(game,out)
   end, 12000)
   if mod.log then
-    mod.log:info("Colosseum UI 1.1.0: Gen I UI/world palette safety locks active")
+    mod.log:info("Colosseum UI 2.2.5: type-layout/transition/performance compatibility locks active")
   end
 
   mod.hooks:wrap("battle.overlay", battleOverlayHook, 9000)

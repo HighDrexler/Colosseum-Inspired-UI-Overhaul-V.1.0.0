@@ -1,21 +1,24 @@
 {
   "id": "colosseum_ui_overhaul",
   "name": "Colosseum Inspired UI Overhaul",
-  "version": "1.1.0",
+  "version": "2.2.5",
   "author": "Community",
-  "description": "Colosseum-inspired UI overhaul for Gen1Recomp with unified Gen I and Gen II presentation, battle HUDs, menus, PC, Pokédex, naming, evolution, area banners, and compatibility-focused presentation hooks while preserving native gameplay behavior.",
+  "description": "Colosseum-inspired UI overhaul for Gen1Recomp. 2.2.5 centers live Pokemon type indicators in the shared Gen1/Gen2 battle HUD and mirrors the same single/dual-type treatment onto the player HP card. 2.2.4 Gen2 flash suppression and Gen1 Colosseum information-model performance improvements, 2.2.3 Pokedex routing, and 2.2.2 sprite-provider parity remain intact.",
   "profile": "overhaul",
   "entry": "main.lua",
   "category": "UI",
   "priority": 100,
   "dependencies": [],
   "optional_dependencies": [
+    "BATTLE_ART_VOXEL_GEN2",
     "BATTLE_ART_VOXEL_FORK",
     "DRAMALESS_SHAPE",
     "DRAMATIC_SHAPE",
     "STADIUM_BATTLE_FX",
     "BATTLE_CINEMATICS",
-    "potato_voxel"
+    "potato_voxel",
+    "COLOSSEUM_BATTLE_ENVIRONMENTS",
+    "STADIUM2_OVERWORLD_MODELS"
   ],
   "conflicts": [
     "gen3_battle_ui"
@@ -33,4 +36,3 @@
   ],
   "github": "HighDrexler/Colosseum-Inspired-UI-Overhaul-V.1.0.0"
 }
-
