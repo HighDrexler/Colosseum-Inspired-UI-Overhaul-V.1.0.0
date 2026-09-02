@@ -1,4 +1,4 @@
-name: Import verified 2.0.2 repository payload
+name: Import verified 2.2.5 repository payload
 
 on:
   push:
@@ -28,13 +28,13 @@ jobs:
             echo 'run=no' >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Download and verify exact tested release asset
+      - name: Download and verify exact tested 2.2.5 release asset
         if: steps.guard.outputs.run == 'yes'
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_SHA256: 9ab6b3fe03306dd70ad0b6673f7b7850fe3f0d732496fbab23c459a6c458347e
-          ASSET: Colosseum-Inspired-UI-Overhaul-2.0.2.zip
-          TAG: v2.0.0
+          EXPECTED_SHA256: c957077d644a4d3912321cf8a7f618f7db4566abe9af7ae1f0e3ce2290a81aa7
+          ASSET: Colosseum-Inspired-UI-Overhaul-2.2.5.zip
+          TAG: v2.2.5
         shell: bash
         run: |
           set -euo pipefail
@@ -50,12 +50,13 @@ jobs:
           unzip -q "/tmp/colosseum-release/$ASSET" -d /tmp/colosseum-payload
           test -s /tmp/colosseum-payload/main.lua
           test -s /tmp/colosseum-payload/manifest.json
-          jq -e '.id == "colosseum_ui_overhaul" and .entry == "main.lua" and .version == "2.0.2" and (.games | index("gen1")) and (.games | index("gen2"))' /tmp/colosseum-payload/manifest.json
+          jq -e '.id == "colosseum_ui_overhaul" and .entry == "main.lua" and .version == "2.2.5" and (.games | index("gen1")) and (.games | index("gen2"))' /tmp/colosseum-payload/manifest.json
           test -s /tmp/colosseum-payload/assets/audio/colosseum_title.ogg
           test "$(find /tmp/colosseum-payload/assets/portraits -type f -name '*.png' | wc -l)" -eq 530
-          test "$(find /tmp/colosseum-payload/assets/portrait_corrections -type f -name '*.png' | wc -l)" -eq 4
-          test ! -e /tmp/colosseum-payload/assets/portrait_map.json
-          test "$(find /tmp/colosseum-payload -type f -name '*.b64' | wc -l)" -eq 0
+          test "$(find /tmp/colosseum-payload/assets/portrait_corrections -type f -name '*.b64' | wc -l)" -eq 4
+          test -s /tmp/colosseum-payload/assets/portrait_map.json
+          test -s /tmp/colosseum-payload/RELEASE_NOTES_2.2.5.md
+          test -s /tmp/colosseum-payload/VALIDATION_2.2.5.md
 
       - name: Replace repository payload at root
         if: steps.guard.outputs.run == 'yes'
@@ -74,9 +75,9 @@ jobs:
           test -s main.lua
           test -s manifest.json
           test -d assets
-          test "$(jq -r '.version' manifest.json)" = '2.0.2'
+          test "$(jq -r '.version' manifest.json)" = '2.2.5'
 
-      - name: Commit verified payload to main
+      - name: Commit verified 2.2.5 payload to main
         if: steps.guard.outputs.run == 'yes'
         shell: bash
         run: |
@@ -85,7 +86,7 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
           git diff --cached --quiet && { echo 'No payload changes required.'; exit 0; }
-          git commit -m 'Replace repository payload with verified v2.0.2'
+          git commit -m 'Replace repository payload with verified v2.2.5'
           git push origin HEAD:main
 
       - name: Verify launcher-ready repository root
@@ -96,5 +97,5 @@ jobs:
           test -s main.lua
           test -s manifest.json
           test -d assets
-          test "$(jq -r '.version' manifest.json)" = '2.0.2'
-          echo 'Verified: main.lua, manifest.json, and assets are direct repository-root entries.'
+          test "$(jq -r '.version' manifest.json)" = '2.2.5'
+          echo 'Verified: main.lua, manifest.json, and assets are direct repository-root entries for v2.2.5.'
