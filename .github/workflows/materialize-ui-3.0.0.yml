@@ -36,9 +36,6 @@ jobs:
             curl --fail --silent --show-error --location "${RAW}/${rel}" --output "$rel"
           }
 
-          # Start the large UI implementation from the exact combined source that
-          # UI 3.0.0 was split from, then apply only the standalone preference/
-          # identity delta. This avoids lossy reconstruction of the 1 MB Lua file.
           fetch_runtime UIMain.lua
           test "$(git hash-object UIMain.lua)" = '4fc95a2566942ec3d5d4fb6de6ed40a947263a67'
           git apply .ui3/UIMain.patch
@@ -77,18 +74,16 @@ jobs:
           test "$(git hash-object assets/portrait_corrections/141.png)" = 'cb2e8e603da6c9d4b69950ab36bb7f48a9c7c933'
           test "$(git hash-object assets/portrait_corrections/141_shiny.png)" = 'e296962f9769df7ceb567ecdb9a6c8d80e623463'
 
-          # Remove historical package notes and the obsolete alternate portrait
-          # representations. The final dev branch intentionally ships no Markdown.
-          find . -path './.git' -prune -o -type f -name '*.md' -delete
+          # Final distributable cleanup. Exclude .git from filesystem checks without
+          # combining find -prune with -delete (GNU find deliberately rejects that).
+          find . -type f -name '*.md' -not -path './.git/*' -delete
           rm -f assets/portrait_map.json
           rm -f assets/portrait_corrections/*.b64
-
-          # Staging machinery is not part of the distributable repository.
           rm -rf .ui3 .github
 
           test ! -e assets/portrait_map.json
-          test "$(find . -path './.git' -prune -o -type f -name '*.md' -print | wc -l)" -eq 0
-          test "$(find . -path './.git' -prune -o -type f -print | wc -l)" -eq 545
+          test "$(find . -type f -name '*.md' -not -path './.git/*' -print | wc -l)" -eq 0
+          test "$(find . -type f -not -path './.git/*' -print | wc -l)" -eq 545
           test "$(jq -r '.version' manifest.json)" = '3.0.0'
           test "$(jq -r '.id' manifest.json)" = 'colosseum_ui_overhaul'
           test -f main.lua
